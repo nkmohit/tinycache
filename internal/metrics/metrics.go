@@ -20,6 +20,7 @@ const (
 type Event struct {
 	Type      EventType `json:"type"`
 	Key       string    `json:"key,omitempty"`
+	Value     string    `json:"value,omitempty"`
 	Hit       *bool     `json:"hit,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
 	LatencyUS int64     `json:"latencyUs,omitempty"`
@@ -31,6 +32,9 @@ type LatencyStats struct {
 	MinUS int64 `json:"minUs"`
 	MaxUS int64 `json:"maxUs"`
 	AvgUS int64 `json:"avgUs"`
+	P50US int64 `json:"p50Us"`
+	P95US int64 `json:"p95Us"`
+	P99US int64 `json:"p99Us"`
 }
 
 type Snapshot struct {
@@ -75,6 +79,7 @@ type latencyAccumulator struct {
 	totalUS int64
 	minUS   int64
 	maxUS   int64
+	samples []int64
 }
 
 func NewRecorder(eventLimit int) *Recorder {
@@ -121,6 +126,7 @@ func (r *Recorder) Record(command string, latency time.Duration, event Event) {
 	}
 	acc.count++
 	acc.totalUS += us
+	acc.samples = appendSample(acc.samples, us, 1024)
 	if us < acc.minUS {
 		acc.minUS = us
 	}
@@ -158,11 +164,15 @@ func (r *Recorder) Snapshot(keyCount int, memoryBytes int64) Snapshot {
 		if acc.count > 0 {
 			avg = acc.totalUS / acc.count
 		}
+		p50, p95, p99 := percentiles(acc.samples)
 		latencies[command] = LatencyStats{
 			Count: acc.count,
 			MinUS: acc.minUS,
 			MaxUS: acc.maxUS,
 			AvgUS: avg,
+			P50US: p50,
+			P95US: p95,
+			P99US: p99,
 		}
 	}
 
@@ -187,6 +197,54 @@ func (r *Recorder) Snapshot(keyCount int, memoryBytes int64) Snapshot {
 		KeyCount:         keyCount,
 		MemoryBytes:      memoryBytes,
 		LatencyByCommand: latencies,
+	}
+}
+
+func appendSample(samples []int64, value int64, limit int) []int64 {
+	if limit <= 0 {
+		return samples
+	}
+	if len(samples) == limit {
+		copy(samples, samples[1:])
+		samples[len(samples)-1] = value
+		return samples
+	}
+	return append(samples, value)
+}
+
+func percentiles(samples []int64) (int64, int64, int64) {
+	if len(samples) == 0 {
+		return 0, 0, 0
+	}
+	copied := make([]int64, len(samples))
+	copy(copied, samples)
+	sortInt64s(copied)
+	return percentile(copied, 0.50), percentile(copied, 0.95), percentile(copied, 0.99)
+}
+
+func percentile(sorted []int64, p float64) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(float64(len(sorted)-1) * p)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+func sortInt64s(values []int64) {
+	for i := 1; i < len(values); i++ {
+		current := values[i]
+		j := i - 1
+		for j >= 0 && values[j] > current {
+			values[j+1] = values[j]
+			j--
+		}
+		values[j+1] = current
 	}
 }
 

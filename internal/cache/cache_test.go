@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -159,6 +161,29 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 }
 
+func TestLFUEvictsLeastFrequentlyUsed(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU})
+
+	mustSet(t, c, "a", "1")
+	mustSet(t, c, "b", "2")
+	for i := 0; i < 4; i++ {
+		if _, err := c.Get(context.Background(), "a"); err != nil {
+			t.Fatalf("get a failed: %v", err)
+		}
+	}
+	if _, err := c.Get(context.Background(), "b"); err != nil {
+		t.Fatalf("get b failed: %v", err)
+	}
+	mustSet(t, c, "c", "3")
+
+	if result, _ := c.Get(context.Background(), "b"); result.Hit {
+		t.Fatal("expected b to be evicted by LFU")
+	}
+	if result, _ := c.Get(context.Background(), "a"); !result.Hit {
+		t.Fatal("expected frequently used a to remain")
+	}
+}
+
 func TestUpdateExistingKeyDoesNotIncreaseKeyCount(t *testing.T) {
 	c := newTestCache(t, Options{MaxKeys: 1})
 
@@ -193,6 +218,73 @@ func TestConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestSnapshotKeysFiltersSortsAndLimits(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 10})
+
+	mustSet(t, c, "session:1", "value")
+	mustSet(t, c, "session:2", "larger-value")
+	mustSet(t, c, "user:1", "value")
+	if _, err := c.Get(context.Background(), "session:1"); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+
+	keys := c.SnapshotKeys(KeyQuery{
+		Filter: "session",
+		Sort:   "access",
+		Desc:   true,
+		Limit:  1,
+	})
+	if len(keys) != 1 || keys[0].Key != "session:1" {
+		t.Fatalf("unexpected queried keys: %#v", keys)
+	}
+}
+
+func TestSaveAndLoadSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinycache.snapshot.json")
+	c := newTestCache(t, Options{MaxKeys: 10, SnapshotPath: path})
+	mustSet(t, c, "name", "tiny")
+
+	if err := c.SaveSnapshot(""); err != nil {
+		t.Fatalf("save snapshot failed: %v", err)
+	}
+	loaded := newTestCache(t, Options{MaxKeys: 10, SnapshotPath: path})
+	result, err := loaded.Get(context.Background(), "name")
+	if err != nil {
+		t.Fatalf("get loaded key failed: %v", err)
+	}
+	if !result.Hit || result.Value != "tiny" {
+		t.Fatalf("expected loaded snapshot value, got %#v", result)
+	}
+}
+
+func TestAppendLogReplayRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinycache.aof")
+	c := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path})
+
+	mustSet(t, c, "name", "tiny")
+	if updated, err := c.Expire(context.Background(), "name", 30*time.Second); err != nil || !updated {
+		t.Fatalf("expire failed updated=%v err=%v", updated, err)
+	}
+	if deleted, err := c.Delete(context.Background(), "name"); err != nil || !deleted {
+		t.Fatalf("delete failed deleted=%v err=%v", deleted, err)
+	}
+	c.Close()
+
+	records, err := c.ReplayRecords()
+	if err != nil {
+		t.Fatalf("replay records failed: %v", err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("expected 3 records, got %#v", records)
+	}
+	if records[0].Command != "set" || records[1].Command != "expire" || records[2].Command != "del" {
+		t.Fatalf("unexpected records: %#v", records)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected append log file: %v", err)
+	}
 }
 
 func BenchmarkSet(b *testing.B) {
