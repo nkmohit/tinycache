@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mohneeru/tinycache/internal/cache"
-	"github.com/mohneeru/tinycache/internal/httpapi"
+	"github.com/nkmohit/tinycache/internal/cache"
+	"github.com/nkmohit/tinycache/internal/httpapi"
 )
 
 func main() {

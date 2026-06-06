@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mohneeru/tinycache/internal/metrics"
+	"github.com/nkmohit/tinycache/internal/metrics"
 )
 
 var (

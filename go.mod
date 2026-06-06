@@ -1,3 +1,3 @@
-module github.com/mohneeru/tinycache
+module github.com/nkmohit/tinycache
 
 go 1.22

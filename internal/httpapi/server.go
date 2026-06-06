@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/mohneeru/tinycache/internal/cache"
+	"github.com/nkmohit/tinycache/internal/cache"
 )
 
 type Server struct {

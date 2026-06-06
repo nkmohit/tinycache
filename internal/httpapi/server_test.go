@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohneeru/tinycache/internal/cache"
+	"github.com/nkmohit/tinycache/internal/cache"
 )
 
 func TestCommandEndpoints(t *testing.T) {
