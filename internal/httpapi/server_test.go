@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -101,6 +102,68 @@ func TestDebugAndMetricsEndpoints(t *testing.T) {
 	status, body = request(t, s, http.MethodGet, "/debug/events", "")
 	if status != http.StatusOK || len(body["events"].([]any)) == 0 {
 		t.Fatalf("unexpected events response status=%d body=%v", status, body)
+	}
+}
+
+func TestCORSPreflight(t *testing.T) {
+	s := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodOptions, "/command/set", nil)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("expected wildcard cors origin, got %q", got)
+	}
+}
+
+func TestStaticUIServing(t *testing.T) {
+	c := cache.New(cache.Options{
+		MaxKeys:         10,
+		CleanupInterval: time.Hour,
+		EventLogSize:    100,
+	})
+	t.Cleanup(c.Close)
+	s := NewWithOptions(c, Options{UIDir: "../../web/cachescope"})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("CacheScope")) {
+		t.Fatalf("expected CacheScope UI body, got %s", rec.Body.String())
+	}
+}
+
+func TestDebugEventStream(t *testing.T) {
+	s := newTestServer(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/debug/events/stream", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.ServeHTTP(rec, req)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stream handler did not stop after request cancellation")
+	}
+
+	if !bytes.Contains(rec.Body.Bytes(), []byte("event: snapshot")) {
+		t.Fatalf("expected snapshot event, got %s", rec.Body.String())
 	}
 }
 
