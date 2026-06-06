@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CacheScope</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div>
+          <p class="eyebrow">TinyCache</p>
+          <h1>CacheScope</h1>
+        </div>
+        <nav class="nav">
+          <a href="#overview">Overview</a>
+          <a href="#keys">Keys</a>
+          <a href="#events">Events</a>
+          <a href="#command">Command</a>
+        </nav>
+        <div class="connection" id="connectionStatus">Connecting</div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Internal Observability</p>
+            <h2>Redis-inspired cache engine debugger</h2>
+          </div>
+          <button id="refreshButton" type="button">Refresh</button>
+        </header>
+
+        <section id="overview" class="overview">
+          <div class="metric">
+            <span>Keys</span>
+            <strong id="keyCount">0</strong>
+          </div>
+          <div class="metric">
+            <span>Hit Ratio</span>
+            <strong id="hitRatio">0%</strong>
+          </div>
+          <div class="metric">
+            <span>Evictions</span>
+            <strong id="evictions">0</strong>
+          </div>
+          <div class="metric">
+            <span>Memory</span>
+            <strong id="memoryBytes">0 B</strong>
+          </div>
+        </section>
+
+        <section class="grid">
+          <section class="panel" id="keys">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Browser</p>
+                <h3>Keys</h3>
+              </div>
+              <input id="keyFilter" type="search" placeholder="Filter keys" />
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Key</th>
+                    <th>TTL</th>
+                    <th>Hits</th>
+                    <th>Size</th>
+                  </tr>
+                </thead>
+                <tbody id="keysTable"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Recency</p>
+                <h3>LRU List</h3>
+              </div>
+            </div>
+            <ol class="lru-list" id="lruList"></ol>
+          </section>
+
+          <section class="panel" id="events">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Timeline</p>
+                <h3>Operation Log</h3>
+              </div>
+            </div>
+            <div class="events" id="eventsList"></div>
+          </section>
+
+          <section class="panel" id="command">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Client</p>
+                <h3>Send Command</h3>
+              </div>
+            </div>
+            <form id="commandForm" class="command-form">
+              <label>
+                Command
+                <select id="commandName">
+                  <option value="set">SET</option>
+                  <option value="get">GET</option>
+                  <option value="del">DEL</option>
+                  <option value="expire">EXPIRE</option>
+                  <option value="ttl">TTL</option>
+                </select>
+              </label>
+              <label>
+                Key
+                <input id="commandKey" required placeholder="session:1" />
+              </label>
+              <label id="valueField">
+                Value
+                <input id="commandValue" placeholder="cached payload" />
+              </label>
+              <label id="ttlField">
+                TTL seconds
+                <input id="commandTTL" type="number" min="0" placeholder="60" />
+              </label>
+              <button type="submit">Execute</button>
+            </form>
+            <pre id="commandOutput">{}</pre>
+          </section>
+        </section>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -15,7 +15,8 @@ go run ./cmd/tinycache \
   --addr :8080 \
   --max-keys 1000 \
   --cleanup-interval 1s \
-  --event-log-size 1000
+  --event-log-size 1000 \
+  --ui-dir web/cachescope
 ```
 
 ## Commands
@@ -41,7 +42,31 @@ curl -X DELETE 'http://localhost:8080/command/del?key=name'
 - `GET /debug/keys` returns key metadata only.
 - `GET /debug/lru` returns keys from most-recently-used to least-recently-used.
 - `GET /debug/events` returns the bounded recent operation and eviction log.
+- `GET /debug/events/stream` streams live snapshots for CacheScope over server-sent events.
 - `GET /healthz` returns server health.
+
+## CacheScope
+
+Run TinyCache with the static UI enabled:
+
+```sh
+make run
+```
+
+Then open `http://localhost:8080`.
+
+Useful Make targets:
+
+```sh
+make fmt
+make test
+make race
+make bench
+make run
+make smoke
+```
+
+Sample HTTP requests are available in `examples/tinycache.http`.
 
 ## Test
 
