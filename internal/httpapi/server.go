@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -10,8 +11,13 @@ import (
 )
 
 type Server struct {
-	cache *cache.Cache
-	mux   *http.ServeMux
+	cache  *cache.Cache
+	mux    *http.ServeMux
+	uiDir  string
+}
+
+type Options struct {
+	UIDir string
 }
 
 type setRequest struct {
@@ -26,15 +32,25 @@ type expireRequest struct {
 }
 
 func New(c *cache.Cache) *Server {
+	return NewWithOptions(c, Options{})
+}
+
+func NewWithOptions(c *cache.Cache, opts Options) *Server {
 	s := &Server{
 		cache: c,
 		mux:   http.NewServeMux(),
+		uiDir: opts.UIDir,
 	}
 	s.routes()
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -48,7 +64,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /debug/keys", s.handleDebugKeys)
 	s.mux.HandleFunc("GET /debug/lru", s.handleDebugLRU)
 	s.mux.HandleFunc("GET /debug/events", s.handleDebugEvents)
+	s.mux.HandleFunc("GET /debug/events/stream", s.handleDebugEventStream)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	if s.uiDir != "" {
+		s.mux.Handle("GET /", http.FileServer(http.Dir(s.uiDir)))
+	}
 }
 
 func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
@@ -144,6 +164,44 @@ func (s *Server) handleDebugEvents(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": s.cache.Events()})
 }
 
+func (s *Server) handleDebugEventStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		payload := map[string]any{
+			"metrics": s.cache.Metrics(),
+			"keys":    s.cache.SnapshotDebug().Keys,
+			"lru":     s.cache.LRUKeys(),
+			"events":  s.cache.Events(),
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		if _, err := fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", data); err != nil {
+			return
+		}
+		flusher.Flush()
+
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -180,6 +238,12 @@ func writeJSONStatus(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
 func ttlDuration(seconds int64) time.Duration {

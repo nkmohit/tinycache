@@ -19,6 +19,7 @@ func main() {
 	maxKeys := flag.Int("max-keys", 1000, "maximum number of keys before LRU eviction")
 	cleanupInterval := flag.Duration("cleanup-interval", time.Second, "TTL cleanup interval")
 	eventLogSize := flag.Int("event-log-size", 1000, "number of recent debug events to retain")
+	uiDir := flag.String("ui-dir", "", "optional directory to serve CacheScope static UI")
 	flag.Parse()
 
 	c := cache.New(cache.Options{
@@ -30,7 +31,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              *addr,
-		Handler:           httpapi.New(c),
+		Handler:           httpapi.NewWithOptions(c, httpapi.Options{UIDir: *uiDir}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
