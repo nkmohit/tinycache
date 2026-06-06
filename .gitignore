@@ -1,0 +1,14 @@
+.DS_Store
+
+# Go build outputs
+/bin/
+/dist/
+/coverage.out
+
+# Local environment
+.env
+.env.*
+
+# Editor metadata
+.idea/
+.vscode/

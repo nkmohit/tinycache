@@ -1,0 +1,45 @@
+### Health
+GET http://localhost:8080/healthz
+
+### Set a key with TTL
+POST http://localhost:8080/command/set
+Content-Type: application/json
+
+{
+  "key": "name",
+  "value": "tiny",
+  "ttlSeconds": 60
+}
+
+### Get a key
+GET http://localhost:8080/command/get?key=name
+
+### Read TTL
+GET http://localhost:8080/command/ttl?key=name
+
+### Update TTL
+POST http://localhost:8080/command/expire
+Content-Type: application/json
+
+{
+  "key": "name",
+  "ttlSeconds": 120
+}
+
+### Delete a key
+DELETE http://localhost:8080/command/del?key=name
+
+### Metrics
+GET http://localhost:8080/metrics
+
+### Key metadata
+GET http://localhost:8080/debug/keys
+
+### LRU order
+GET http://localhost:8080/debug/lru
+
+### Recent events
+GET http://localhost:8080/debug/events
+
+### Live event stream
+GET http://localhost:8080/debug/events/stream
