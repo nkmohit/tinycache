@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -93,6 +94,16 @@ func TestDebugAndMetricsEndpoints(t *testing.T) {
 		t.Fatalf("unexpected debug keys response status=%d body=%v", status, body)
 	}
 
+	status, body = request(t, s, http.MethodGet, "/debug/keys?filter=a&sort=access&desc=true&limit=1", "")
+	if status != http.StatusOK || len(body["keys"].([]any)) != 1 {
+		t.Fatalf("unexpected queried debug keys response status=%d body=%v", status, body)
+	}
+
+	status, body = request(t, s, http.MethodGet, "/debug/summary", "")
+	if status != http.StatusOK || body["metrics"] == nil || body["keys"] == nil || body["lru"] == nil || body["events"] == nil {
+		t.Fatalf("unexpected debug summary response status=%d body=%v", status, body)
+	}
+
 	status, body = request(t, s, http.MethodGet, "/debug/lru", "")
 	keys := body["keys"].([]any)
 	if status != http.StatusOK || keys[0] != "a" {
@@ -164,6 +175,56 @@ func TestDebugEventStream(t *testing.T) {
 
 	if !bytes.Contains(rec.Body.Bytes(), []byte("event: snapshot")) {
 		t.Fatalf("expected snapshot event, got %s", rec.Body.String())
+	}
+}
+
+func TestDebugReplayEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinycache.aof")
+	c := cache.New(cache.Options{
+		MaxKeys:         10,
+		CleanupInterval: time.Hour,
+		EventLogSize:    100,
+		AppendLogPath:   path,
+	})
+	t.Cleanup(c.Close)
+	s := New(c)
+
+	request(t, s, http.MethodPost, "/command/set", `{"key":"name","value":"tiny"}`)
+
+	status, body := request(t, s, http.MethodGet, "/debug/replay", "")
+	records := body["records"].([]any)
+	if status != http.StatusOK || len(records) != 1 || body["source"] != "appendLog" {
+		t.Fatalf("unexpected replay response status=%d body=%v", status, body)
+	}
+}
+
+func TestAdminSnapshotEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinycache.snapshot.json")
+	c := cache.New(cache.Options{
+		MaxKeys:         10,
+		CleanupInterval: time.Hour,
+		EventLogSize:    100,
+		SnapshotPath:    path,
+	})
+	t.Cleanup(c.Close)
+	s := New(c)
+
+	request(t, s, http.MethodPost, "/command/set", `{"key":"name","value":"tiny"}`)
+	status, body := request(t, s, http.MethodPost, "/admin/snapshot", "")
+	if status != http.StatusOK || body["ok"] != true {
+		t.Fatalf("unexpected snapshot response status=%d body=%v", status, body)
+	}
+
+	loaded := cache.New(cache.Options{
+		MaxKeys:         10,
+		CleanupInterval: time.Hour,
+		EventLogSize:    100,
+		SnapshotPath:    path,
+	})
+	t.Cleanup(loaded.Close)
+	result, err := loaded.Get(context.Background(), "name")
+	if err != nil || !result.Hit {
+		t.Fatalf("expected snapshot to load key, result=%#v err=%v", result, err)
 	}
 }
 

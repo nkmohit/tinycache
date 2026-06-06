@@ -19,6 +19,9 @@ func main() {
 	maxKeys := flag.Int("max-keys", 1000, "maximum number of keys before LRU eviction")
 	cleanupInterval := flag.Duration("cleanup-interval", time.Second, "TTL cleanup interval")
 	eventLogSize := flag.Int("event-log-size", 1000, "number of recent debug events to retain")
+	evictionPolicy := flag.String("eviction-policy", "lru", "eviction policy: lru or lfu")
+	snapshotPath := flag.String("snapshot-path", "", "optional JSON snapshot path to load on start and save through /admin/snapshot")
+	appendLogPath := flag.String("aof-path", "", "optional append-only operation log path")
 	uiDir := flag.String("ui-dir", "", "optional directory to serve CacheScope static UI")
 	flag.Parse()
 
@@ -26,6 +29,9 @@ func main() {
 		MaxKeys:         *maxKeys,
 		CleanupInterval: *cleanupInterval,
 		EventLogSize:    *eventLogSize,
+		EvictionPolicy:  cache.EvictionPolicy(*evictionPolicy),
+		SnapshotPath:    *snapshotPath,
+		AppendLogPath:   *appendLogPath,
 	})
 	defer c.Close()
 

@@ -41,5 +41,17 @@ GET http://localhost:8080/debug/lru
 ### Recent events
 GET http://localhost:8080/debug/events
 
+### One-call UI summary
+GET http://localhost:8080/debug/summary
+
+### Filter and sort key metadata
+GET http://localhost:8080/debug/keys?filter=session&sort=access&desc=true&limit=5
+
+### Replay records from append-only log
+GET http://localhost:8080/debug/replay
+
 ### Live event stream
 GET http://localhost:8080/debug/events/stream
+
+### Save configured snapshot
+POST http://localhost:8080/admin/snapshot

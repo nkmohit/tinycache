@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/nkmohit/tinycache/internal/cache"
@@ -29,6 +30,10 @@ type setRequest struct {
 type expireRequest struct {
 	Key        string `json:"key"`
 	TTLSeconds int64  `json:"ttlSeconds"`
+}
+
+type snapshotRequest struct {
+	Path string `json:"path,omitempty"`
 }
 
 func New(c *cache.Cache) *Server {
@@ -62,9 +67,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /command/ttl", s.handleTTL)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET /debug/keys", s.handleDebugKeys)
+	s.mux.HandleFunc("GET /debug/summary", s.handleDebugSummary)
 	s.mux.HandleFunc("GET /debug/lru", s.handleDebugLRU)
 	s.mux.HandleFunc("GET /debug/events", s.handleDebugEvents)
 	s.mux.HandleFunc("GET /debug/events/stream", s.handleDebugEventStream)
+	s.mux.HandleFunc("GET /debug/replay", s.handleDebugReplay)
+	s.mux.HandleFunc("POST /admin/snapshot", s.handleAdminSnapshot)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	if s.uiDir != "" {
 		s.mux.Handle("GET /", http.FileServer(http.Dir(s.uiDir)))
@@ -152,8 +160,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.cache.Metrics())
 }
 
-func (s *Server) handleDebugKeys(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.cache.SnapshotDebug())
+func (s *Server) handleDebugKeys(w http.ResponseWriter, r *http.Request) {
+	query, ok := keyQueryFromRequest(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": s.cache.SnapshotKeys(query)})
+}
+
+func (s *Server) handleDebugSummary(w http.ResponseWriter, r *http.Request) {
+	query, ok := keyQueryFromRequest(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, s.cache.Summary(query))
 }
 
 func (s *Server) handleDebugLRU(w http.ResponseWriter, _ *http.Request) {
@@ -162,6 +182,43 @@ func (s *Server) handleDebugLRU(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleDebugEvents(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": s.cache.Events()})
+}
+
+func (s *Server) handleDebugReplay(w http.ResponseWriter, _ *http.Request) {
+	records, err := s.cache.ReplayRecords()
+	if err != nil && !errors.Is(err, cache.ErrAppendLogPath) {
+		writeError(w, http.StatusInternalServerError, "could not read replay log")
+		return
+	}
+	if errors.Is(err, cache.ErrAppendLogPath) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"records": []cache.ReplayRecord{},
+			"source":  "none",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"records": records,
+		"source":  "appendLog",
+	})
+}
+
+func (s *Server) handleAdminSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req snapshotRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+	}
+	if err := s.cache.SaveSnapshot(req.Path); err != nil {
+		if errors.Is(err, cache.ErrSnapshotPath) {
+			writeError(w, http.StatusBadRequest, "snapshot path is not configured")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "could not save snapshot")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleDebugEventStream(w http.ResponseWriter, r *http.Request) {
@@ -179,12 +236,7 @@ func (s *Server) handleDebugEventStream(w http.ResponseWriter, r *http.Request) 
 	defer ticker.Stop()
 
 	for {
-		payload := map[string]any{
-			"metrics": s.cache.Metrics(),
-			"keys":    s.cache.SnapshotDebug().Keys,
-			"lru":     s.cache.LRUKeys(),
-			"events":  s.cache.Events(),
-		}
+		payload := s.cache.Summary(cache.KeyQuery{})
 		data, err := json.Marshal(payload)
 		if err != nil {
 			return
@@ -244,6 +296,25 @@ func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func keyQueryFromRequest(w http.ResponseWriter, r *http.Request) (cache.KeyQuery, bool) {
+	values := r.URL.Query()
+	limit := 0
+	if raw := values.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+			return cache.KeyQuery{}, false
+		}
+		limit = parsed
+	}
+	return cache.KeyQuery{
+		Filter: values.Get("filter"),
+		Sort:   values.Get("sort"),
+		Desc:   values.Get("desc") == "true" || values.Get("order") == "desc",
+		Limit:  limit,
+	}, true
 }
 
 func ttlDuration(seconds int64) time.Duration {
