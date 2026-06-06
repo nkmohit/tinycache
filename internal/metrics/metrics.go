@@ -34,19 +34,19 @@ type LatencyStats struct {
 }
 
 type Snapshot struct {
-	StartedAt       time.Time               `json:"startedAt"`
-	UptimeSeconds   int64                   `json:"uptimeSeconds"`
-	TotalRequests   int64                   `json:"totalRequests"`
-	Hits            int64                   `json:"hits"`
-	Misses          int64                   `json:"misses"`
-	Sets            int64                   `json:"sets"`
-	Deletes         int64                   `json:"deletes"`
-	Expires         int64                   `json:"expires"`
-	Evictions       int64                   `json:"evictions"`
-	Cleanups        int64                   `json:"cleanups"`
-	HitRatio        float64                 `json:"hitRatio"`
-	KeyCount        int                     `json:"keyCount"`
-	MemoryBytes     int64                   `json:"memoryBytes"`
+	StartedAt        time.Time               `json:"startedAt"`
+	UptimeSeconds    int64                   `json:"uptimeSeconds"`
+	TotalRequests    int64                   `json:"totalRequests"`
+	Hits             int64                   `json:"hits"`
+	Misses           int64                   `json:"misses"`
+	Sets             int64                   `json:"sets"`
+	Deletes          int64                   `json:"deletes"`
+	Expires          int64                   `json:"expires"`
+	Evictions        int64                   `json:"evictions"`
+	Cleanups         int64                   `json:"cleanups"`
+	HitRatio         float64                 `json:"hitRatio"`
+	KeyCount         int                     `json:"keyCount"`
+	MemoryBytes      int64                   `json:"memoryBytes"`
 	LatencyByCommand map[string]LatencyStats `json:"latencyByCommand"`
 }
 
@@ -82,8 +82,8 @@ func NewRecorder(eventLimit int) *Recorder {
 		eventLimit = 0
 	}
 	return &Recorder{
-		startedAt: time.Now().UTC(),
-		latencies: map[string]*latencyAccumulator{},
+		startedAt:  time.Now().UTC(),
+		latencies:  map[string]*latencyAccumulator{},
 		eventLimit: eventLimit,
 		events:     make([]Event, 0, eventLimit),
 	}
@@ -173,19 +173,19 @@ func (r *Recorder) Snapshot(keyCount int, memoryBytes int64) Snapshot {
 	}
 
 	return Snapshot{
-		StartedAt:       r.startedAt,
-		UptimeSeconds:   int64(time.Since(r.startedAt).Seconds()),
-		TotalRequests:   r.totalRequests,
-		Hits:            r.hits,
-		Misses:          r.misses,
-		Sets:            r.sets,
-		Deletes:         r.deletes,
-		Expires:         r.expires,
-		Evictions:       r.evictions,
-		Cleanups:        r.cleanups,
-		HitRatio:        ratio,
-		KeyCount:        keyCount,
-		MemoryBytes:     memoryBytes,
+		StartedAt:        r.startedAt,
+		UptimeSeconds:    int64(time.Since(r.startedAt).Seconds()),
+		TotalRequests:    r.totalRequests,
+		Hits:             r.hits,
+		Misses:           r.misses,
+		Sets:             r.sets,
+		Deletes:          r.deletes,
+		Expires:          r.expires,
+		Evictions:        r.evictions,
+		Cleanups:         r.cleanups,
+		HitRatio:         ratio,
+		KeyCount:         keyCount,
+		MemoryBytes:      memoryBytes,
 		LatencyByCommand: latencies,
 	}
 }

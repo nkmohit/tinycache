@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	ErrEmptyKey    = errors.New("key cannot be empty")
+	ErrEmptyKey   = errors.New("key cannot be empty")
 	ErrInvalidTTL = errors.New("ttl cannot be negative")
 )
 

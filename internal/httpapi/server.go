@@ -11,9 +11,9 @@ import (
 )
 
 type Server struct {
-	cache  *cache.Cache
-	mux    *http.ServeMux
-	uiDir  string
+	cache *cache.Cache
+	mux   *http.ServeMux
+	uiDir string
 }
 
 type Options struct {
