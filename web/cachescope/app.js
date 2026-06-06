@@ -3,6 +3,7 @@ const state = {
   keys: [],
   lru: [],
   events: [],
+  replay: [],
 };
 
 const els = {
@@ -12,10 +13,12 @@ const els = {
   hitRatio: document.querySelector("#hitRatio"),
   evictions: document.querySelector("#evictions"),
   memoryBytes: document.querySelector("#memoryBytes"),
+  p95Latency: document.querySelector("#p95Latency"),
   keyFilter: document.querySelector("#keyFilter"),
   keysTable: document.querySelector("#keysTable"),
   lruList: document.querySelector("#lruList"),
   eventsList: document.querySelector("#eventsList"),
+  replayList: document.querySelector("#replayList"),
   commandForm: document.querySelector("#commandForm"),
   commandName: document.querySelector("#commandName"),
   commandKey: document.querySelector("#commandKey"),
@@ -41,17 +44,16 @@ async function fetchJSON(path, options) {
 }
 
 async function refreshSnapshot() {
-  const [metrics, keys, lru, events] = await Promise.all([
-    fetchJSON("/metrics"),
-    fetchJSON("/debug/keys"),
-    fetchJSON("/debug/lru"),
-    fetchJSON("/debug/events"),
+  const [summary, replay] = await Promise.all([
+    fetchJSON("/debug/summary?sort=access&desc=true"),
+    fetchJSON("/debug/replay"),
   ]);
 
-  state.metrics = metrics;
-  state.keys = keys.keys || [];
-  state.lru = lru.keys || [];
-  state.events = events.events || [];
+  state.metrics = summary.metrics;
+  state.keys = summary.keys || [];
+  state.lru = summary.lru || [];
+  state.events = summary.events || [];
+  state.replay = replay.records || [];
   render();
 }
 
@@ -81,10 +83,12 @@ function render() {
   els.hitRatio.textContent = `${Math.round((metrics.hitRatio || 0) * 100)}%`;
   els.evictions.textContent = formatNumber(metrics.evictions || 0);
   els.memoryBytes.textContent = formatBytes(metrics.memoryBytes || 0);
+  els.p95Latency.textContent = `${formatNumber(maxP95Latency(metrics.latencyByCommand || {}))} us`;
 
   renderKeys();
   renderLRU();
   renderEvents();
+  renderReplay();
 }
 
 function renderKeys() {
@@ -96,12 +100,13 @@ function renderKeys() {
       return `<tr>
         <td>${escapeHTML(item.key)}</td>
         <td>${formatTTL(item.ttl)}</td>
-        <td>${formatNumber(item.accessCount || 0)}</td>
+        <td class="${item.accessCount > 3 ? "hot" : ""}">${formatNumber(item.accessCount || 0)}</td>
         <td>${formatBytes(item.sizeBytes || 0)}</td>
+        <td>${formatTime(item.lastAccessedAt)}</td>
       </tr>`;
     });
 
-  els.keysTable.innerHTML = rows.join("") || `<tr><td colspan="4">No keys</td></tr>`;
+  els.keysTable.innerHTML = rows.join("") || `<tr><td colspan="5">No keys</td></tr>`;
 }
 
 function renderLRU() {
@@ -124,6 +129,22 @@ function renderEvents() {
       </div>`;
     })
     .join("") || `<div class="event-meta">No events yet</div>`;
+}
+
+function renderReplay() {
+  const records = [...state.replay].reverse().slice(0, 30);
+  els.replayList.innerHTML = records
+    .map((record) => {
+      const meta = [record.key, record.ttlSeconds ? `${record.ttlSeconds}s` : "", record.value ? "value" : ""]
+        .filter(Boolean)
+        .join(" · ");
+      return `<div class="event">
+        <span class="event-type">${escapeHTML(record.command || "")}</span>
+        <span>${escapeHTML(meta || "mutation")}</span>
+        <span class="event-meta">${formatTime(record.at)}</span>
+      </div>`;
+    })
+    .join("") || `<div class="event-meta">Enable --aof-path to record replay data</div>`;
 }
 
 async function executeCommand(event) {
@@ -178,6 +199,10 @@ function formatTTL(ttl) {
   if (ttl === -1) return "No expiry";
   if (ttl === -2) return "Missing";
   return `${ttl}s`;
+}
+
+function maxP95Latency(latencies) {
+  return Object.values(latencies).reduce((max, item) => Math.max(max, item.p95Us || 0), 0);
 }
 
 function formatTime(value) {

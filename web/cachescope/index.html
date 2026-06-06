@@ -48,6 +48,10 @@
             <span>Memory</span>
             <strong id="memoryBytes">0 B</strong>
           </div>
+          <div class="metric">
+            <span>P95 Latency</span>
+            <strong id="p95Latency">0 us</strong>
+          </div>
         </section>
 
         <section class="grid">
@@ -67,6 +71,7 @@
                     <th>TTL</th>
                     <th>Hits</th>
                     <th>Size</th>
+                    <th>Last Access</th>
                   </tr>
                 </thead>
                 <tbody id="keysTable"></tbody>
@@ -92,6 +97,16 @@
               </div>
             </div>
             <div class="events" id="eventsList"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Replay</p>
+                <h3>Append Log</h3>
+              </div>
+            </div>
+            <div class="events" id="replayList"></div>
           </section>
 
           <section class="panel" id="command">

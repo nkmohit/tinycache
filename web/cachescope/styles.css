@@ -144,7 +144,7 @@ h3 {
 
 .overview {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   margin-bottom: 24px;
@@ -209,6 +209,11 @@ td {
   padding: 11px 8px;
   text-align: left;
   white-space: nowrap;
+}
+
+td.hot {
+  color: var(--accent);
+  font-weight: 700;
 }
 
 th {
