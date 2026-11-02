@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"math/rand"
 	"os"
 	"sort"
@@ -50,6 +51,8 @@ type Options struct {
 	EvictionPolicy  EvictionPolicy
 	SnapshotPath    string
 	AppendLogPath   string
+	// AppendFsync is always, everysec, or no. Empty means everysec.
+	AppendFsync FsyncPolicy
 }
 
 type Cache struct {
@@ -71,7 +74,8 @@ type Cache struct {
 
 	snapshotPath  string
 	appendLogPath string
-	appendLog     *os.File
+	aof           *appendLogger
+	aofDone       chan struct{}
 
 	stopCleanup chan struct{}
 	closeOnce   sync.Once
@@ -164,6 +168,11 @@ func New(opts Options) *Cache {
 	if evictionPolicy != EvictionLRU && evictionPolicy != EvictionLFU {
 		evictionPolicy = EvictionLRU
 	}
+	fsyncPolicy, err := ParseFsyncPolicy(string(opts.AppendFsync))
+	if err != nil {
+		log.Printf("tinycache aof: %v", err)
+		fsyncPolicy = FsyncEverySec
+	}
 
 	c := &Cache{
 		items:          map[string]*entry{},
@@ -174,15 +183,18 @@ func New(opts Options) *Cache {
 		recorder:       metrics.NewRecorder(opts.EventLogSize),
 		snapshotPath:   opts.SnapshotPath,
 		appendLogPath:  opts.AppendLogPath,
+		aof:            openAppendLogger(opts.AppendLogPath, fsyncPolicy),
 		stopCleanup:    make(chan struct{}),
 	}
 	if opts.SnapshotPath != "" {
 		_ = c.loadSnapshot(opts.SnapshotPath)
 	}
-	if opts.AppendLogPath != "" {
-		if file, err := os.OpenFile(opts.AppendLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-			c.appendLog = file
-		}
+	if c.aof.runsBackgroundSync() {
+		c.aofDone = make(chan struct{})
+		go func() {
+			defer close(c.aofDone)
+			c.aof.everySecLoop(c.stopCleanup)
+		}()
 	}
 	go c.cleanupLoop(cleanupInterval)
 	return c
@@ -191,8 +203,11 @@ func New(opts Options) *Cache {
 func (c *Cache) Close() {
 	c.closeOnce.Do(func() {
 		close(c.stopCleanup)
-		if c.appendLog != nil {
-			_ = c.appendLog.Close()
+		if c.aofDone != nil {
+			<-c.aofDone
+		}
+		if err := c.aof.close(); err != nil {
+			log.Printf("tinycache aof: close: %v", err)
 		}
 	})
 }
@@ -230,14 +245,13 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 		item.sizeBytes = size
 		c.lru.MoveToFront(item.lruElement)
 		c.trackTTLLocked(item)
-		c.appendLogLocked(ReplayRecord{
+		return c.appendLogLocked(ReplayRecord{
 			Command:    "set",
 			Key:        key,
 			Value:      value,
 			TTLSeconds: int64(ttl.Seconds()),
 			At:         now,
 		})
-		return nil
 	}
 
 	for len(c.items) >= c.maxKeys {
@@ -263,14 +277,13 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 	c.trackTTLLocked(item)
 
 	c.evictUntilWithinLimitLocked()
-	c.appendLogLocked(ReplayRecord{
+	return c.appendLogLocked(ReplayRecord{
 		Command:    "set",
 		Key:        key,
 		Value:      value,
 		TTLSeconds: int64(ttl.Seconds()),
 		At:         now,
 	})
-	return nil
 }
 
 func (c *Cache) Get(_ context.Context, key string) (GetResult, error) {
@@ -331,11 +344,13 @@ func (c *Cache) Delete(_ context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	c.removeItemLocked(item, "")
-	c.appendLogLocked(ReplayRecord{
+	if err := c.appendLogLocked(ReplayRecord{
 		Command: "del",
 		Key:     key,
 		At:      time.Now().UTC(),
-	})
+	}); err != nil {
+		return true, err
+	}
 	return true, nil
 }
 
@@ -371,12 +386,14 @@ func (c *Cache) Expire(_ context.Context, key string, ttl time.Duration) (bool, 
 	item.expiresAt = expiryFromTTL(now, ttl)
 	item.updatedAt = now
 	c.trackTTLLocked(item)
-	c.appendLogLocked(ReplayRecord{
+	if err := c.appendLogLocked(ReplayRecord{
 		Command:    "expire",
 		Key:        key,
 		TTLSeconds: int64(ttl.Seconds()),
 		At:         now,
-	})
+	}); err != nil {
+		return true, err
+	}
 	return true, nil
 }
 
@@ -701,15 +718,8 @@ func (c *Cache) removeItemLocked(item *entry, reason string) {
 	}
 }
 
-func (c *Cache) appendLogLocked(record ReplayRecord) {
-	if c.appendLog == nil {
-		return
-	}
-	data, err := json.Marshal(record)
-	if err != nil {
-		return
-	}
-	_, _ = c.appendLog.Write(append(data, '\n'))
+func (c *Cache) appendLogLocked(record ReplayRecord) error {
+	return c.aof.write(record)
 }
 
 func (c *Cache) loadSnapshot(path string) error {

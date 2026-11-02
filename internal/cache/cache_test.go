@@ -2,9 +2,11 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -446,6 +448,232 @@ func TestAppendLogReplayRecords(t *testing.T) {
 		t.Fatalf("expected append log file: %v", err)
 	}
 }
+
+func TestAOFWriteErrorSurfaces(t *testing.T) {
+	c := newTestCache(t, Options{
+		MaxKeys:       4,
+		AppendLogPath: filepath.Join(t.TempDir(), "tinycache.aof"),
+		AppendFsync:   FsyncNo,
+	})
+	c.aof.mu.Lock()
+	real := c.aof.file
+	c.aof.file = errSyncWriter{err: errors.New("disk full")}
+	c.aof.mu.Unlock()
+	t.Cleanup(func() {
+		if real != nil {
+			_ = real.Close()
+		}
+	})
+
+	err := c.Set(context.Background(), "name", "tiny", 0)
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected aof write error, got %v", err)
+	}
+}
+
+func TestAOFDeviceWriteErrorSurfaces(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("/dev/full is not available")
+	}
+	c := newTestCache(t, Options{
+		MaxKeys:       4,
+		AppendLogPath: "/dev/full",
+		AppendFsync:   FsyncNo,
+	})
+	err := c.Set(context.Background(), "name", "tiny", 0)
+	if err == nil {
+		t.Fatal("expected /dev/full write to surface an error")
+	}
+}
+
+func TestAOFOpenErrorSurfaces(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 4, AppendLogPath: t.TempDir(), AppendFsync: FsyncNo})
+	err := c.Set(context.Background(), "name", "tiny", 0)
+	if err == nil {
+		t.Fatal("expected append log open error to surface on set")
+	}
+}
+
+func TestAppendFsyncAlwaysSyncsEachWrite(t *testing.T) {
+	c := newTestCache(t, Options{
+		MaxKeys:       4,
+		AppendLogPath: filepath.Join(t.TempDir(), "tinycache.aof"),
+		AppendFsync:   FsyncAlways,
+	})
+	fake := &fakeAOF{}
+	c.aof.mu.Lock()
+	real := c.aof.file
+	c.aof.file = fake
+	c.aof.mu.Unlock()
+	t.Cleanup(func() {
+		if real != nil {
+			_ = real.Close()
+		}
+	})
+
+	for _, key := range []string{"a", "b", "c"} {
+		if err := c.Set(context.Background(), key, "v", 0); err != nil {
+			t.Fatalf("set %s: %v", key, err)
+		}
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.writes != 3 || fake.syncs != 3 {
+		t.Fatalf("writes=%d syncs=%d, want 3 writes and 3 syncs", fake.writes, fake.syncs)
+	}
+}
+
+func TestAppendFsyncNoSkipsSync(t *testing.T) {
+	fake := &fakeAOF{}
+	logger := &appendLogger{file: fake, policy: FsyncNo, interval: time.Second}
+	if err := logger.write(ReplayRecord{Command: "set", Key: "k", Value: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.close(); err != nil {
+		t.Fatal(err)
+	}
+	if fake.writes != 1 || fake.syncs != 0 {
+		t.Fatalf("writes=%d syncs=%d, want 1 write and 0 syncs", fake.writes, fake.syncs)
+	}
+}
+
+func TestAppendFsyncEverySecTicksAndShutsDown(t *testing.T) {
+	fake := &fakeAOF{}
+	logger := &appendLogger{file: fake, policy: FsyncEverySec, interval: 15 * time.Millisecond}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		logger.everySecLoop(stop)
+	}()
+
+	if err := logger.write(ReplayRecord{Command: "set", Key: "k", Value: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	syncedOnWrite := fake.syncs
+	fake.mu.Unlock()
+	if syncedOnWrite != 0 {
+		t.Fatalf("everysec synced inside write, syncs=%d", syncedOnWrite)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		fake.mu.Lock()
+		synced := fake.syncs
+		fake.mu.Unlock()
+		if synced >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	fake.mu.Lock()
+	synced := fake.syncs
+	fake.mu.Unlock()
+	if synced < 1 {
+		t.Fatal("background ticker did not fsync")
+	}
+
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("everysec loop did not return after stop")
+	}
+}
+
+func TestAOFReplayAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinycache.aof")
+	c := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path, AppendFsync: FsyncAlways})
+	mustSet(t, c, "name", "tiny")
+	if updated, err := c.Expire(context.Background(), "name", 30*time.Second); err != nil || !updated {
+		t.Fatalf("expire updated=%v err=%v", updated, err)
+	}
+	if deleted, err := c.Delete(context.Background(), "name"); err != nil || !deleted {
+		t.Fatalf("delete deleted=%v err=%v", deleted, err)
+	}
+	c.Close()
+
+	restarted := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path, AppendFsync: FsyncEverySec})
+	records, err := restarted.ReplayRecords()
+	if err != nil {
+		t.Fatalf("replay records: %v", err)
+	}
+	if len(records) != 3 || records[0].Command != "set" || records[1].Command != "expire" || records[2].Command != "del" {
+		t.Fatalf("unexpected records: %#v", records)
+	}
+
+	replayed := newTestCache(t, Options{MaxKeys: 10})
+	for _, record := range records {
+		switch record.Command {
+		case "set":
+			if err := replayed.Set(context.Background(), record.Key, record.Value, time.Duration(record.TTLSeconds)*time.Second); err != nil {
+				t.Fatalf("replay set: %v", err)
+			}
+		case "expire":
+			if _, err := replayed.Expire(context.Background(), record.Key, time.Duration(record.TTLSeconds)*time.Second); err != nil {
+				t.Fatalf("replay expire: %v", err)
+			}
+		case "del":
+			if _, err := replayed.Delete(context.Background(), record.Key); err != nil {
+				t.Fatalf("replay del: %v", err)
+			}
+		default:
+			t.Fatalf("unknown command %s", record.Command)
+		}
+	}
+	result, err := replayed.Get(context.Background(), "name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Hit {
+		t.Fatal("replayed delete should leave name missing")
+	}
+}
+
+func TestParseFsyncPolicy(t *testing.T) {
+	policy, err := ParseFsyncPolicy("")
+	if err != nil || policy != FsyncEverySec {
+		t.Fatalf("empty policy = %s err=%v", policy, err)
+	}
+	if _, err := ParseFsyncPolicy("sometimes"); err == nil {
+		t.Fatal("expected invalid policy error")
+	}
+}
+
+type fakeAOF struct {
+	mu     sync.Mutex
+	writes int
+	syncs  int
+	err    error
+}
+
+func (f *fakeAOF) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	f.writes++
+	return len(p), nil
+}
+
+func (f *fakeAOF) Sync() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncs++
+	return nil
+}
+
+func (f *fakeAOF) Close() error { return nil }
+
+type errSyncWriter struct {
+	err error
+}
+
+func (w errSyncWriter) Write([]byte) (int, error) { return 0, w.err }
+func (w errSyncWriter) Sync() error               { return nil }
+func (w errSyncWriter) Close() error              { return nil }
 
 func BenchmarkSet(b *testing.B) {
 	c := New(Options{MaxKeys: b.N + 1})

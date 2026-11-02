@@ -22,8 +22,14 @@ func main() {
 	evictionPolicy := flag.String("eviction-policy", "lru", "eviction policy: lru or lfu")
 	snapshotPath := flag.String("snapshot-path", "", "optional JSON snapshot path to load on start and save through /admin/snapshot")
 	appendLogPath := flag.String("aof-path", "", "optional append-only operation log path")
+	appendFsync := flag.String("appendfsync", "everysec", "aof fsync policy: always, everysec, or no")
 	uiDir := flag.String("ui-dir", "", "optional directory to serve CacheScope static UI")
 	flag.Parse()
+
+	fsyncPolicy, err := cache.ParseFsyncPolicy(*appendFsync)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	c := cache.New(cache.Options{
 		MaxKeys:         *maxKeys,
@@ -32,6 +38,7 @@ func main() {
 		EvictionPolicy:  cache.EvictionPolicy(*evictionPolicy),
 		SnapshotPath:    *snapshotPath,
 		AppendLogPath:   *appendLogPath,
+		AppendFsync:     fsyncPolicy,
 	})
 	defer c.Close()
 
