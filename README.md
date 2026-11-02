@@ -30,8 +30,8 @@ go run ./cmd/tinycache \
   --cleanup-interval 1s \
   --event-log-size 1000 \
   --eviction-policy lru \
-  --snapshot-path /private/tmp/tinycache.snapshot.json \
-  --aof-path /private/tmp/tinycache.aof \
+  --snapshot-path "${TMPDIR:-/tmp}/tinycache.snapshot.json" \
+  --aof-path "${TMPDIR:-/tmp}/tinycache.aof" \
   --ui-dir web/cachescope
 ```
 
@@ -77,6 +77,8 @@ Then open `http://localhost:8080`.
 Useful Make targets:
 
 ```sh
+make
+make build
 make fmt
 make test
 make race
