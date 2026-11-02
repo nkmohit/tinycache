@@ -273,6 +273,8 @@ func writeCacheError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, cache.ErrEmptyKey), errors.Is(err, cache.ErrInvalidTTL):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, cache.ErrOOM):
+		writeError(w, http.StatusInsufficientStorage, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}

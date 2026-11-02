@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -133,7 +134,7 @@ func TestCORSPreflight(t *testing.T) {
 
 func TestStaticUIServing(t *testing.T) {
 	c := cache.New(cache.Options{
-		MaxKeys:         10,
+		MaxKeys:         64,
 		CleanupInterval: time.Hour,
 		EventLogSize:    100,
 	})
@@ -181,7 +182,7 @@ func TestDebugEventStream(t *testing.T) {
 func TestDebugReplayEndpoint(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tinycache.aof")
 	c := cache.New(cache.Options{
-		MaxKeys:         10,
+		MaxKeys:         64,
 		CleanupInterval: time.Hour,
 		EventLogSize:    100,
 		AppendLogPath:   path,
@@ -201,7 +202,7 @@ func TestDebugReplayEndpoint(t *testing.T) {
 func TestAdminSnapshotEndpoint(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tinycache.snapshot.json")
 	c := cache.New(cache.Options{
-		MaxKeys:         10,
+		MaxKeys:         64,
 		CleanupInterval: time.Hour,
 		EventLogSize:    100,
 		SnapshotPath:    path,
@@ -216,7 +217,7 @@ func TestAdminSnapshotEndpoint(t *testing.T) {
 	}
 
 	loaded := cache.New(cache.Options{
-		MaxKeys:         10,
+		MaxKeys:         64,
 		CleanupInterval: time.Hour,
 		EventLogSize:    100,
 		SnapshotPath:    path,
@@ -228,10 +229,53 @@ func TestAdminSnapshotEndpoint(t *testing.T) {
 	}
 }
 
+func TestNoEvictionReturnsInsufficientStorage(t *testing.T) {
+	c := cache.New(cache.Options{
+		MaxKeys:         16,
+		EvictionPolicy:  cache.EvictionNoEviction,
+		CleanupInterval: time.Hour,
+		EventLogSize:    10,
+	})
+	t.Cleanup(c.Close)
+	s := New(c)
+
+	oks, ooms := 0, 0
+	stored := ""
+	for i := 0; i < 32; i++ {
+		key := "k" + strconv.Itoa(i)
+		status, body := request(t, s, http.MethodPost, "/command/set", `{"key":"`+key+`","value":"v"}`)
+		switch status {
+		case http.StatusOK:
+			oks++
+			if stored == "" {
+				stored = key
+			}
+		case http.StatusInsufficientStorage:
+			ooms++
+			if body["error"] == nil {
+				t.Fatalf("oom body=%v", body)
+			}
+		default:
+			t.Fatalf("set %s status=%d body=%v", key, status, body)
+		}
+	}
+	if oks == 0 || ooms == 0 {
+		t.Fatalf("ok=%d oom=%d", oks, ooms)
+	}
+	status, body := request(t, s, http.MethodPost, "/command/set", `{"key":"`+stored+`","value":"updated"}`)
+	if status != http.StatusOK || body["ok"] != true {
+		t.Fatalf("update status=%d body=%v", status, body)
+	}
+	status, body = request(t, s, http.MethodGet, "/command/get?key="+stored, "")
+	if status != http.StatusOK || body["value"] != "updated" {
+		t.Fatalf("get status=%d body=%v", status, body)
+	}
+}
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	c := cache.New(cache.Options{
-		MaxKeys:         10,
+		MaxKeys:         64,
 		CleanupInterval: time.Hour,
 		EventLogSize:    100,
 	})

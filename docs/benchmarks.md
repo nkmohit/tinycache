@@ -133,3 +133,59 @@ LFU on the bench CLI went from 27,944 ops/s to 1,599,824 ops/s (57×) and now si
 Parallel GETs went from 1,007 ns/op to 768 ns/op, and the mixed parallel bench from 676 ns/op to 446 ns/op. A single-threaded `BenchmarkGetHit` did not change in any meaningful way (295 ns/op to 289 ns/op): one hot key still takes one shard lock.
 
 Single-threaded `BenchmarkSet` (852 ns/op to 1,040 ns/op) and `BenchmarkEvictLRU` (651 ns/op to 934 ns/op) got slower. Inserts take an admission lock, and an eviction at the global max locks every shard long enough to compare the 16 local victims. That cost shows up when one goroutine is already the only writer. The LRU bench CLI moved from 1,987,993 ops/s to 1,761,864 ops/s for the same reason.
+
+## After per-shard budgets
+
+Same machine as above. Remeasured immediately before this change (16 shards, one global victim, admission lock on insert), then again with each shard evicting under its own lock. Both sides are the median of three runs. ops/s for the Go benchmarks is `1e9 / ns/op`, rounded to the nearest integer.
+
+```sh
+go test -bench . -benchmem -count=3 ./internal/cache
+go run ./cmd/tinycache-bench --ops 100000 --max-keys 10000 --write-ratio 0.30 --eviction-policy lru
+go run ./cmd/tinycache-bench --ops 100000 --max-keys 10000 --write-ratio 0.30 --eviction-policy lfu
+```
+
+The bench CLI still passes `lru` and `lfu`, which are the exact policies. Approximate policies are not in this table. This VM's rerun of the previous code landed a little off the single run recorded above (Set 1,040 ns/op, LRU CLI 1,761,864 ops/s), so the before column is the paired median rather than that writeup.
+
+### Before
+
+One admission lock on every new key. At the global cap, an eviction locks all 16 shards and compares their local victims.
+
+| Benchmark | ns/op | B/op | allocs/op | ops/s |
+| --- | ---: | ---: | ---: | ---: |
+| BenchmarkSet | 1068 | 355 | 4 | 936,330 |
+| BenchmarkGetHit | 296.6 | 1 | 1 | 3,371,544 |
+| BenchmarkGetMiss | 288.4 | 1 | 1 | 3,467,406 |
+| BenchmarkEvictLRU | 1008 | 232 | 4 | 992,063 |
+| BenchmarkEvictLFU | 1041 | 280 | 5 | 960,615 |
+| BenchmarkGetHitParallel | 745.8 | 1 | 1 | 1,340,842 |
+| BenchmarkMixedParallel | 503.3 | 0 | 0 | 1,986,886 |
+
+| Policy | Duration | ops/s | Keys | Evictions |
+| --- | ---: | ---: | ---: | ---: |
+| LRU | 60 ms | 1,651,650 | 10000 | 20000 |
+| LFU | 68 ms | 1,451,155 | 10000 | 20000 |
+
+### After
+
+`maxKeys` is split across the shards (`total/16`, remainder on the first shards). `maxmemory`, when set, is split the same way. A full shard evicts one of its own keys and does not lock the others. There is no admission lock.
+
+| Benchmark | ns/op | B/op | allocs/op | ops/s |
+| --- | ---: | ---: | ---: | ---: |
+| BenchmarkSet | 898.0 | 332 | 4 | 1,113,586 |
+| BenchmarkGetHit | 305.6 | 1 | 1 | 3,272,251 |
+| BenchmarkGetMiss | 301.7 | 1 | 1 | 3,314,551 |
+| BenchmarkEvictLRU | 745.8 | 232 | 4 | 1,340,842 |
+| BenchmarkEvictLFU | 778.8 | 280 | 5 | 1,284,027 |
+| BenchmarkGetHitParallel | 707.0 | 1 | 1 | 1,414,427 |
+| BenchmarkMixedParallel | 473.5 | 0 | 0 | 2,111,932 |
+
+| Policy | Duration | ops/s | Keys | Evictions |
+| --- | ---: | ---: | ---: | ---: |
+| LRU | 55 ms | 1,788,250 | 10000 | 20000 |
+| LFU | 62 ms | 1,587,813 | 10000 | 20000 |
+
+`BenchmarkEvictLRU` went from 1,008 ns/op to 746 ns/op, and `BenchmarkEvictLFU` from 1,041 ns/op to 779 ns/op. Allocations on those two are unchanged. `BenchmarkSet` went from 1,068 ns/op to 898 ns/op. The three Set runs were 1,183, 898, and 824 ns/op, so the median is the middle one; its B/op is 332 because that iteration's `b.N` grew the map a different number of times, not because the per-insert allocation count changed (still 4). A single hot `BenchmarkGetHit` stayed near 300 ns/op.
+
+The LRU bench CLI went from 1,651,650 ops/s to 1,788,250 ops/s, and LFU from 1,451,155 to 1,587,813. At 100,000 ops the CLI duration sits in a band of about 10 ms, and the medians still move with the eviction benchmarks.
+
+The cost of the split is skew. A shard can evict while another still has room, so a `MaxKeys` of `n+1` no longer guarantees that `n` inserts are eviction-free. Exact `lru` and `lfu` are unchanged as algorithms; they just run on the shard's own list or frequency buckets. `allkeys-lru` and `allkeys-lfu` instead sample 5 keys in that shard and drop the worst by LRU clock or logarithmic LFU counter.
