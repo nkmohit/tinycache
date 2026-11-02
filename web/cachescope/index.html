@@ -3,149 +3,201 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>CacheScope</title>
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem("cachescope-theme");
+          if (theme === "light" || theme === "dark") {
+            document.documentElement.setAttribute("data-theme", theme);
+          }
+        } catch (error) {
+          /* storage can be blocked; the system theme still applies */
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="./styles.css" />
   </head>
-  <body>
-    <main class="shell">
-      <aside class="sidebar">
-        <div>
-          <p class="eyebrow">TinyCache</p>
+  <body data-conn="connecting">
+    <a class="skip" href="#keyspace">Skip to keyspace</a>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
           <h1>CacheScope</h1>
+          <span id="host" class="host"></span>
+          <span id="engine" class="engine"></span>
         </div>
-        <nav class="nav">
-          <a href="#overview">Overview</a>
-          <a href="#keys">Keys</a>
-          <a href="#events">Events</a>
-          <a href="#command">Command</a>
-        </nav>
-        <div class="connection" id="connectionStatus">Connecting</div>
-      </aside>
+        <div class="top-status">
+          <span id="conn" class="conn" role="status">Connecting</span>
+          <span id="uptime" class="uptime">Up —</span>
+        </div>
+        <div class="top-actions">
+          <label class="theme-field">
+            <span>Theme</span>
+            <select id="theme">
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <button id="refresh" type="button" aria-keyshortcuts="R">Refresh</button>
+        </div>
+      </header>
 
-      <section class="workspace">
-        <header class="topbar">
-          <div>
-            <p class="eyebrow">Internal Observability</p>
-            <h2>Redis-inspired cache engine debugger</h2>
+      <div id="banner" class="banner" hidden></div>
+
+      <section class="stats" aria-label="Statistics">
+        <article class="stat">
+          <p id="opsLabel">Ops/s</p>
+          <strong id="opsValue" aria-labelledby="opsLabel">—</strong>
+          <div class="stat-foot">
+            <span id="opsDetail">Waiting for samples</span>
+            <svg id="opsSpark" class="spark spark-accent" viewBox="0 0 80 24" aria-hidden="true"></svg>
           </div>
-          <button id="refreshButton" type="button">Refresh</button>
-        </header>
-
-        <section id="overview" class="overview">
-          <div class="metric">
-            <span>Keys</span>
-            <strong id="keyCount">0</strong>
+        </article>
+        <article class="stat">
+          <p id="hitLabel">Hit rate</p>
+          <strong id="hitValue" aria-labelledby="hitLabel">—</strong>
+          <div class="stat-foot">
+            <span id="hitDetail">No reads yet</span>
+            <svg id="hitSpark" class="spark" viewBox="0 0 80 24" aria-hidden="true"></svg>
           </div>
-          <div class="metric">
-            <span>Hit Ratio</span>
-            <strong id="hitRatio">0%</strong>
+        </article>
+        <article class="stat">
+          <p id="keysLabel">Keys</p>
+          <strong id="keysValue" aria-labelledby="keysLabel">—</strong>
+          <div class="stat-foot">
+            <span id="keysDetail">Resident</span>
+            <svg id="keysSpark" class="spark" viewBox="0 0 80 24" aria-hidden="true"></svg>
           </div>
-          <div class="metric">
-            <span>Evictions</span>
-            <strong id="evictions">0</strong>
+        </article>
+        <article class="stat">
+          <p id="memLabel">Memory</p>
+          <strong id="memValue" aria-labelledby="memLabel">—</strong>
+          <div class="stat-foot">
+            <span id="memDetail">Estimated</span>
+            <svg id="memSpark" class="spark" viewBox="0 0 80 24" aria-hidden="true"></svg>
           </div>
-          <div class="metric">
-            <span>Memory</span>
-            <strong id="memoryBytes">0 B</strong>
+        </article>
+        <article class="stat">
+          <p id="evictLabel">Evictions</p>
+          <strong id="evictValue" aria-labelledby="evictLabel">—</strong>
+          <div class="stat-foot">
+            <span id="evictDetail">Total</span>
+            <svg id="evictSpark" class="spark" viewBox="0 0 80 24" aria-hidden="true"></svg>
           </div>
-          <div class="metric">
-            <span>P95 Latency</span>
-            <strong id="p95Latency">0 us</strong>
-          </div>
-        </section>
-
-        <section class="grid">
-          <section class="panel" id="keys">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Browser</p>
-                <h3>Keys</h3>
-              </div>
-              <input id="keyFilter" type="search" placeholder="Filter keys" />
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Key</th>
-                    <th>TTL</th>
-                    <th>Hits</th>
-                    <th>Size</th>
-                    <th>Last Access</th>
-                  </tr>
-                </thead>
-                <tbody id="keysTable"></tbody>
-              </table>
-            </div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Recency</p>
-                <h3>LRU List</h3>
-              </div>
-            </div>
-            <ol class="lru-list" id="lruList"></ol>
-          </section>
-
-          <section class="panel" id="events">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Timeline</p>
-                <h3>Operation Log</h3>
-              </div>
-            </div>
-            <div class="events" id="eventsList"></div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Replay</p>
-                <h3>Append Log</h3>
-              </div>
-            </div>
-            <div class="events" id="replayList"></div>
-          </section>
-
-          <section class="panel" id="command">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Client</p>
-                <h3>Send Command</h3>
-              </div>
-            </div>
-            <form id="commandForm" class="command-form">
-              <label>
-                Command
-                <select id="commandName">
-                  <option value="set">SET</option>
-                  <option value="get">GET</option>
-                  <option value="del">DEL</option>
-                  <option value="expire">EXPIRE</option>
-                  <option value="ttl">TTL</option>
-                </select>
-              </label>
-              <label>
-                Key
-                <input id="commandKey" required placeholder="session:1" />
-              </label>
-              <label id="valueField">
-                Value
-                <input id="commandValue" placeholder="cached payload" />
-              </label>
-              <label id="ttlField">
-                TTL seconds
-                <input id="commandTTL" type="number" min="0" placeholder="60" />
-              </label>
-              <button type="submit">Execute</button>
-            </form>
-            <pre id="commandOutput">{}</pre>
-          </section>
-        </section>
+        </article>
       </section>
-    </main>
+
+      <div class="stage">
+        <section class="panel chart-panel" aria-labelledby="chartTitle">
+          <header>
+            <h2 id="chartTitle">Throughput</h2>
+            <p class="legend">
+              <span><i class="swatch"></i>Ops/s <b id="legendOps">—</b></span>
+              <span><i class="swatch lat"></i>p95 <b id="legendLat">—</b></span>
+            </p>
+            <span class="sub">60s</span>
+          </header>
+          <div class="chart-frame">
+            <canvas
+              id="chart"
+              tabindex="0"
+              role="img"
+              aria-labelledby="chartTitle"
+              aria-describedby="chartSummary chartHelp"
+            ></canvas>
+            <div id="chartTip" class="tip" hidden>
+              <div id="tipTime" class="tip-time"></div>
+              <div><span>Ops/s</span> <b id="tipOps">—</b></div>
+              <div><span>p95</span> <b id="tipLat">—</b></div>
+            </div>
+          </div>
+          <p id="chartSummary" class="sr">Waiting for samples.</p>
+          <p id="chartHelp" class="sr">Left and right arrow keys move through samples.</p>
+          <p id="chartLive" class="sr" aria-live="polite"></p>
+        </section>
+
+        <section class="panel timeline-panel" aria-labelledby="eventsTitle">
+          <header>
+            <h2 id="eventsTitle">Events</h2>
+            <div class="tabs" role="tablist" aria-label="Event source">
+              <button id="tab-log" type="button" role="tab" aria-controls="eventList" aria-selected="true" tabindex="0">Log</button>
+              <button id="tab-append" type="button" role="tab" aria-controls="eventList" aria-selected="false" tabindex="-1">Append</button>
+            </div>
+            <span id="eventCount" class="sub"></span>
+          </header>
+          <div id="eventFilters" class="filters" role="toolbar" aria-label="Filter events">
+            <button type="button" data-filter="all" aria-pressed="true">All</button>
+            <button type="button" data-filter="evict" aria-pressed="false">Evictions</button>
+            <button type="button" data-filter="read" aria-pressed="false">Reads</button>
+            <button type="button" data-filter="write" aria-pressed="false">Writes</button>
+          </div>
+          <div id="eventList" class="timeline" role="tabpanel" aria-labelledby="eventsTitle" tabindex="0"></div>
+        </section>
+
+        <section class="panel keyspace" id="keyspace" aria-labelledby="keyspaceTitle">
+          <header>
+            <h2 id="keyspaceTitle">Keyspace</h2>
+            <span id="keyCountLabel" class="sub">Loading</span>
+            <input id="keyFilter" type="search" placeholder="Filter" aria-label="Filter keys" aria-keyshortcuts="/" spellcheck="false" />
+          </header>
+          <p id="inspector" class="inspector" hidden></p>
+          <div class="table-scroll">
+            <table>
+              <caption class="sr">Keys currently in memory</caption>
+              <colgroup>
+                <col class="c-key" />
+                <col class="c-type" />
+                <col class="c-size" />
+                <col class="c-ttl" />
+                <col class="c-freq" />
+                <col class="c-recency" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th aria-sort="none"><button type="button" data-sort="key">Key <span class="mark" aria-hidden="true"></span></button></th>
+                  <th aria-sort="none"><button type="button" data-sort="type" title="Value type">Type <span class="mark" aria-hidden="true"></span></button></th>
+                  <th class="num" aria-sort="none"><button type="button" data-sort="size">Size <span class="mark" aria-hidden="true"></span></button></th>
+                  <th class="num" aria-sort="none"><button type="button" data-sort="ttl" title="Time to live">TTL <span class="mark" aria-hidden="true"></span></button></th>
+                  <th class="num" aria-sort="none"><button type="button" data-sort="freq" title="Access count">Freq <span class="mark" aria-hidden="true"></span></button></th>
+                  <th class="num" aria-sort="descending"><button type="button" data-sort="recency" title="Last access">Recency <span class="mark" aria-hidden="true"></span></button></th>
+                </tr>
+              </thead>
+              <tbody id="keysBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <form id="commandForm" class="command" aria-label="Command">
+        <label>
+          <span>Command</span>
+          <select id="commandName">
+            <option value="set">SET</option>
+            <option value="get">GET</option>
+            <option value="del">DEL</option>
+            <option value="expire">EXPIRE</option>
+            <option value="ttl">TTL</option>
+          </select>
+        </label>
+        <label class="grow">
+          <span>Key</span>
+          <input id="commandKey" required autocomplete="off" spellcheck="false" placeholder="session:1" />
+        </label>
+        <label id="valueField" class="grow">
+          <span>Value</span>
+          <input id="commandValue" autocomplete="off" spellcheck="false" placeholder="cached payload" />
+        </label>
+        <label id="ttlField" class="ttl">
+          <span>TTL</span>
+          <input id="commandTTL" type="number" min="0" step="1" inputmode="numeric" placeholder="60" />
+        </label>
+        <button id="commandSubmit" class="primary" type="submit">Run</button>
+        <output id="commandOutput" for="commandKey" hidden></output>
+      </form>
+    </div>
     <script src="./app.js"></script>
   </body>
 </html>

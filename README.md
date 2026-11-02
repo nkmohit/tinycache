@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/nkmohit/tinycache/actions/workflows/ci.yml/badge.svg)](https://github.com/nkmohit/tinycache/actions/workflows/ci.yml)
 
-TinyCache is a Redis-inspired in-memory cache engine with HTTP commands and debugger-friendly observability endpoints. V1 focuses on the core cache internals that CacheScope will visualize later: TTL expiration, LRU eviction, memory/key accounting, command metrics, event logs, and debug snapshots.
+TinyCache is a Redis-inspired in-memory cache engine with HTTP commands and a debugging board. CacheScope shows TTL expiration, eviction, memory and key accounting, command rate and latency, and the event log.
 
 ![CacheScope dashboard](docs/assets/cachescope.png)
 
@@ -63,6 +63,7 @@ curl -X DELETE 'http://localhost:8080/command/del?key=name'
 ## Debug Endpoints
 
 - `GET /metrics` returns aggregate counters, hit ratio, key count, memory estimate, latency summaries, evictions, and uptime.
+- `GET /debug/info` returns the eviction policy and max key count.
 - `GET /debug/keys` returns key metadata only. Supports `filter`, `sort`, `desc`, and `limit`.
 - `GET /debug/summary` returns metrics, keys, LRU order, and recent events in one response.
 - `GET /debug/lru` returns keys from most-recently-used to least-recently-used.
@@ -80,11 +81,19 @@ Run TinyCache with the static UI enabled:
 make run
 ```
 
-Then open `http://localhost:8080`.
+Then open `http://localhost:8080`. The board follows the system light or dark theme.
+
+![CacheScope in the dark theme](docs/assets/cachescope-dark.png)
 
 ![CacheScope evictions](docs/assets/cachescope-evictions.gif)
 
-The clip is CacheScope while `SET` keeps writing into an 8-key cache. The eviction counter climbs and the LRU list turns over. It was recorded with headless Chrome and ffmpeg (`scripts/record-cachescope-gif.js`).
+The clip is CacheScope while `SET` keeps writing into an 8-key cache. The eviction counter climbs, the keyspace turns over, and the event log records each `evict`. Start the server with `--max-keys 8`, then record it with headless Chrome and ffmpeg:
+
+```sh
+CACHESCOPE_DRIVE=1 CACHESCOPE_FRAMES_COUNT=12 CACHESCOPE_FRAME_MS=1000 \
+  CACHESCOPE_GIF=docs/assets/cachescope-evictions.gif CACHESCOPE_FPS=2 \
+  node scripts/record-cachescope-gif.js
+```
 
 Useful Make targets:
 
@@ -111,7 +120,7 @@ make demo
 make screenshot
 ```
 
-The screenshot is written to `docs/assets/cachescope.png`.
+Headless Chrome writes the screenshot to `docs/assets/cachescope.png`. `CACHESCOPE_COLOR_SCHEME=dark` records the dark theme.
 
 ## Benchmarks
 
