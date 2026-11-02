@@ -3,11 +3,9 @@ package cache
 import (
 	"container/list"
 	"context"
-	"encoding/json"
 	"errors"
 	"log"
 	"math/rand"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -113,6 +111,13 @@ type Options struct {
 	// policy looks at before it picks a victim. Zero means the default of 5.
 	// Exact lru and lfu ignore it.
 	MaxMemorySamples int
+	// AOFRewritePercentage rewrites the AOF in the background once the file
+	// has grown by this percent since the last rewrite or since startup.
+	// Zero disables auto rewrite. The server default is 100, matching Redis.
+	AOFRewritePercentage int
+	// AOFRewriteMinSize is the smallest AOF, in bytes, that auto rewrite will
+	// touch. Zero means no minimum. The server default is 64MiB.
+	AOFRewriteMinSize int64
 }
 
 type Cache struct {
@@ -128,6 +133,14 @@ type Cache struct {
 	appendLogPath string
 	aof           *appendLogger
 	aofDone       chan struct{}
+
+	// loading is true only while Open is replaying persistence, before any
+	// background goroutine starts. Writes during recovery must not append.
+	loading atomic.Bool
+
+	// rewriteTestHook runs after the rewrite image is copied and while
+	// commands are still buffered. Tests use it. It is nil outside tests.
+	rewriteTestHook func()
 
 	stopCleanup chan struct{}
 	closeOnce   sync.Once
@@ -230,26 +243,24 @@ type ReplayRecord struct {
 	Key        string    `json:"key,omitempty"`
 	Value      string    `json:"value,omitempty"`
 	TTLSeconds int64     `json:"ttlSeconds,omitempty"`
+	ExpiresAt  time.Time `json:"expiresAt,omitempty"`
 	At         time.Time `json:"at"`
 }
 
-type snapshotFile struct {
-	Version int             `json:"version"`
-	SavedAt time.Time       `json:"savedAt"`
-	Entries []snapshotEntry `json:"entries"`
-}
-
-type snapshotEntry struct {
-	Key            string    `json:"key"`
-	Value          string    `json:"value"`
-	ExpiresAt      time.Time `json:"expiresAt,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
-	LastAccessedAt time.Time `json:"lastAccessedAt"`
-	AccessCount    int64     `json:"accessCount"`
-}
-
+// New opens a cache. A snapshot or AOF error panics. Servers should call Open,
+// which returns that error instead.
 func New(opts Options) *Cache {
+	c, err := Open(opts)
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
+// Open builds a cache and recovers it from the snapshot and the append-only
+// log. A corrupt snapshot or a bad AOF record returns an error and no cache.
+// A torn final AOF record is truncated and logged.
+func Open(opts Options) (*Cache, error) {
 	maxKeys := opts.MaxKeys
 	if maxKeys <= 0 {
 		maxKeys = 1000
@@ -279,9 +290,10 @@ func New(opts Options) *Cache {
 		recorder:       metrics.NewRecorder(opts.EventLogSize),
 		snapshotPath:   opts.SnapshotPath,
 		appendLogPath:  opts.AppendLogPath,
-		aof:            openAppendLogger(opts.AppendLogPath, fsyncPolicy),
+		aof:            openAppendLogger(opts.AppendLogPath, fsyncPolicy, opts.AOFRewritePercentage, opts.AOFRewriteMinSize),
 		stopCleanup:    make(chan struct{}),
 	}
+	c.loading.Store(true)
 	keyCaps := splitCapacity(int64(maxKeys))
 	var memCaps [shardCount]int64
 	if opts.MaxMemory > 0 {
@@ -297,9 +309,11 @@ func New(opts Options) *Cache {
 		c.shards[i].maxMemory = memCaps[i]
 		c.shards[i].rng = rand.New(rand.NewSource(seed + int64(i)*1_000_003))
 	}
-	if opts.SnapshotPath != "" {
-		_ = c.loadSnapshot(opts.SnapshotPath)
+	if err := c.loadFromDisk(); err != nil {
+		_ = c.aof.close()
+		return nil, err
 	}
+	c.loading.Store(false)
 	if c.aof.runsBackgroundSync() {
 		c.aofDone = make(chan struct{})
 		go func() {
@@ -308,7 +322,7 @@ func New(opts Options) *Cache {
 		}()
 	}
 	go c.cleanupLoop(cleanupInterval)
-	return c
+	return c, nil
 }
 
 func (c *Cache) Close() {
@@ -316,6 +330,9 @@ func (c *Cache) Close() {
 		close(c.stopCleanup)
 		if c.aofDone != nil {
 			<-c.aofDone
+		}
+		if c.aof != nil {
+			c.aof.waitRewrite()
 		}
 		if err := c.aof.close(); err != nil {
 			log.Printf("tinycache aof: close: %v", err)
@@ -343,13 +360,7 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 	now := time.Now().UTC()
 	expiresAt := expiryFromTTL(now, ttl)
 	size := estimateSize(key, value)
-	record := ReplayRecord{
-		Command:    "set",
-		Key:        key,
-		Value:      value,
-		TTLSeconds: int64(ttl.Seconds()),
-		At:         now,
-	}
+	record := commandRecord("set", key, value, expiresAt, now)
 
 	s := c.shard(key)
 	s.mu.Lock()
@@ -359,7 +370,7 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 		if err := c.updateExisting(s, item, value, expiresAt, size, now); err != nil {
 			return err
 		}
-		return c.aof.write(record)
+		return c.appendRecord(record)
 	}
 
 	item := &entry{
@@ -375,7 +386,7 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 		return err
 	}
 	c.insertItem(s, item)
-	return c.aof.write(record)
+	return c.appendRecord(record)
 }
 
 func (c *Cache) Get(_ context.Context, key string) (GetResult, error) {
@@ -448,11 +459,7 @@ func (c *Cache) Delete(_ context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	c.removeItem(s, item, "")
-	if err := c.aof.write(ReplayRecord{
-		Command: "del",
-		Key:     key,
-		At:      time.Now().UTC(),
-	}); err != nil {
+	if err := c.appendRecord(commandRecord("del", key, "", time.Time{}, time.Now().UTC())); err != nil {
 		return true, err
 	}
 	return true, nil
@@ -488,15 +495,11 @@ func (c *Cache) Expire(_ context.Context, key string, ttl time.Duration) (bool, 
 		return false, nil
 	}
 
-	item.expiresAt = expiryFromTTL(now, ttl)
+	expiresAt := expiryFromTTL(now, ttl)
+	item.expiresAt = expiresAt
 	item.updatedAt = now
 	s.trackTTL(item)
-	if err := c.aof.write(ReplayRecord{
-		Command:    "expire",
-		Key:        key,
-		TTLSeconds: int64(ttl.Seconds()),
-		At:         now,
-	}); err != nil {
+	if err := c.appendRecord(commandRecord("expire", key, "", expiresAt, now)); err != nil {
 		return true, err
 	}
 	return true, nil
@@ -617,71 +620,6 @@ func (c *Cache) Summary(query KeyQuery) Summary {
 		LRU:     c.LRUKeys(),
 		Events:  c.Events(),
 	}
-}
-
-func (c *Cache) SaveSnapshot(path string) error {
-	if path == "" {
-		path = c.snapshotPath
-	}
-	if path == "" {
-		return ErrSnapshotPath
-	}
-
-	now := time.Now().UTC()
-	c.lockAll()
-	entries := make([]snapshotEntry, 0)
-	for i := range c.shards {
-		s := &c.shards[i]
-		s.removeExpired(now, c)
-		for _, item := range s.items {
-			entries = append(entries, snapshotEntry{
-				Key:            item.key,
-				Value:          item.value,
-				ExpiresAt:      item.expiresAt,
-				CreatedAt:      item.createdAt,
-				UpdatedAt:      item.updatedAt,
-				LastAccessedAt: item.lastAccessedAt,
-				AccessCount:    item.accessCount,
-			})
-		}
-	}
-	c.unlockAll()
-
-	data, err := json.MarshalIndent(snapshotFile{
-		Version: 1,
-		SavedAt: now,
-		Entries: entries,
-	}, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o644)
-}
-
-func (c *Cache) ReplayRecords() ([]ReplayRecord, error) {
-	if c.appendLogPath == "" {
-		return nil, ErrAppendLogPath
-	}
-	data, err := os.ReadFile(c.appendLogPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return []ReplayRecord{}, nil
-		}
-		return nil, err
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	records := make([]ReplayRecord, 0, len(lines))
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var record ReplayRecord
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			return nil, err
-		}
-		records = append(records, record)
-	}
-	return records, nil
 }
 
 func (c *Cache) cleanupLoop(interval time.Duration) {
@@ -1212,6 +1150,11 @@ func (c *Cache) removeItem(s *shard, item *entry, reason string) {
 	c.keyCount.Add(-1)
 	if reason == "max_keys" || reason == "maxmemory" {
 		c.recorder.RecordEviction(item.key, reason)
+		// The compacted rewrite is a point-in-time image. A later eviction has
+		// to be in the rewrite buffer or the deleted key comes back on replay.
+		if c.aof != nil && !c.loading.Load() {
+			_ = c.appendRecord(commandRecord("del", item.key, "", time.Time{}, time.Now().UTC()))
+		}
 	}
 }
 
@@ -1279,47 +1222,6 @@ func (s *shard) recomputeMinFreq() {
 		}
 	}
 	s.minFreq = min
-}
-
-func (c *Cache) loadSnapshot(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	var file snapshotFile
-	if err := json.Unmarshal(data, &file); err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	c.lockAll()
-	defer c.unlockAll()
-	for _, saved := range file.Entries {
-		if !saved.ExpiresAt.IsZero() && !saved.ExpiresAt.After(now) {
-			continue
-		}
-		s := c.shard(saved.Key)
-		if _, exists := s.items[saved.Key]; exists {
-			continue
-		}
-		item := &entry{
-			key:            saved.Key,
-			value:          saved.Value,
-			expiresAt:      saved.ExpiresAt,
-			createdAt:      saved.CreatedAt,
-			updatedAt:      saved.UpdatedAt,
-			lastAccessedAt: saved.LastAccessedAt,
-			accessCount:    saved.AccessCount,
-			sizeBytes:      estimateSize(saved.Key, saved.Value),
-		}
-		if err := c.ensureRoom(s, item.sizeBytes, 1, nil); err != nil {
-			continue
-		}
-		c.insertItem(s, item)
-	}
-	return nil
 }
 
 func (e *entry) expired(now time.Time) bool {

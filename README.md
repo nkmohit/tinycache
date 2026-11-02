@@ -14,7 +14,7 @@ TinyCache is a Redis-inspired in-memory cache engine with HTTP commands and debu
 - A key-count limit and a `maxmemory` byte limit. Each is split across the shards.
 - Metrics with hit ratio, memory estimate, evictions, and latency percentiles.
 - Debug endpoints for keys, LRU order, events, replay records, and one-call UI hydration.
-- JSON snapshot persistence and an append-only log with `always`, `everysec`, or `no` fsync.
+- Checksummed snapshots and an append-only log with `always`, `everysec`, or `no` fsync, rewrite, and crash recovery.
 - CacheScope static dashboard served by the Go server.
 - Demo seeder and benchmark CLI.
 
@@ -38,6 +38,8 @@ go run ./cmd/tinycache \
   --snapshot-path "${TMPDIR:-/tmp}/tinycache.snapshot.json" \
   --aof-path "${TMPDIR:-/tmp}/tinycache.aof" \
   --appendfsync everysec \
+  --auto-aof-rewrite-percentage 100 \
+  --auto-aof-rewrite-min-size 67108864 \
   --ui-dir web/cachescope
 ```
 
@@ -173,15 +175,37 @@ Each shard keeps a doubly linked list per access count and the smallest count th
 
 The price is a second list element on every key, and finding the next minimum when the lowest bucket becomes empty (a walk of the live frequencies, not of the keys). GET promotion is an unlink and a link. The LRU list is still updated so `/debug/lru` can show recency while the policy is LFU. On a 10,000-key working set the bench CLI went from 27,944 ops/s to 1,599,824 ops/s.
 
-### AOF fsync
+### Persistence
+
+Startup loads the snapshot, then replays the append-only file. Expiry is an absolute timestamp, so a key that expired while the process was down stays expired. Layouts are in [docs/persistence.md](docs/persistence.md).
+
+#### Fsync
 
 `--appendfsync` follows Redis `appendfsync`. A failed append is logged and returned to the caller. The memory update has already been applied when that error comes back.
 
 | Policy | What returns | What a crash can lose |
 | --- | --- | --- |
-| `always` | after `fsync` of that command | a command that has not returned success |
+| `always` | after `fsync` of that command | a command whose `fsync` did not finish |
 | `everysec` (default) | after the append | about one second of commands; `Close` syncs once more |
 | `no` | after the append | whatever the kernel has not flushed yet |
+
+#### AOF rewrite
+
+`RewriteAOF` compacts the log to the keys that are live at one moment. Each shard lock is taken in index order, then the AOF lock, and only while that set of keys is copied. The temp file is written after those locks are released. Commands that arrive after the copy go to the live log and into a buffer. A key or memory eviction in that window is a `del` in the buffer, so the evicted key does not return when the file is replayed. Before the new file becomes current, that buffer is appended, the temp file is fsynced, it is renamed over the AOF, and the directory is fsynced. Writers stall for that final fsync and rename, and they keep running while the key set is serialized.
+
+A crash before the rename leaves the previous AOF in place. The compacted file is fsynced before the rename for every `--appendfsync` policy, so the file that is swapped in is a complete image. Commands appended after the swap follow the configured policy again.
+
+The rewritten file starts with a `base` command. Replay clears the in-memory image, including keys that came from the snapshot, then applies the compacted key set. A key deleted before the rewrite stays deleted when an older snapshot still contains it.
+
+Automatic rewrite follows Redis `auto-aof-rewrite-percentage` and `auto-aof-rewrite-min-size`. The server defaults are 100 and 64MiB. Percentage 0 turns it off. The Go library leaves it off until `AOFRewritePercentage` is set. A rewrite starts when the file is at least the minimum size and has grown by that percent since the last rewrite, or since startup when none has run.
+
+#### Snapshots
+
+`SaveSnapshot` writes a temp file in the destination directory, fsyncs it, renames it into place, and fsyncs the directory. A crash during the write keeps the previous snapshot. Version 2 carries CRC-32/IEEE and CRC-64/ECMA-182 of the payload. Load checks both and returns `corrupt snapshot` for a bad checksum, a short file, or JSON that does not parse. Version 1 snapshots, a single JSON document with no checksum, still load.
+
+#### Crash recovery
+
+A final AOF record with no trailing newline that is not valid JSON is cut off and logged, the same idea as Redis `aof-load-truncated yes`. A bad record that ends in a newline aborts startup with `corrupt append-only file`, including when that record is the last line. The process does not serve a half-applied log.
 
 ## Test
 
