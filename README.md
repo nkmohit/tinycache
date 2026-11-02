@@ -1,5 +1,7 @@
 # TinyCache
 
+[![CI](https://github.com/nkmohit/tinycache/actions/workflows/ci.yml/badge.svg)](https://github.com/nkmohit/tinycache/actions/workflows/ci.yml)
+
 TinyCache is a Redis-inspired in-memory cache engine with HTTP commands and debugger-friendly observability endpoints. V1 focuses on the core cache internals that CacheScope will visualize later: TTL expiration, LRU eviction, memory/key accounting, command metrics, event logs, and debug snapshots.
 
 ![CacheScope dashboard](docs/assets/cachescope.png)
