@@ -25,6 +25,8 @@ func main() {
 	snapshotPath := flag.String("snapshot-path", "", "optional JSON snapshot path to load on start and save through /admin/snapshot")
 	appendLogPath := flag.String("aof-path", "", "optional append-only operation log path")
 	appendFsync := flag.String("appendfsync", "everysec", "aof fsync policy: always, everysec, or no")
+	autoRewritePct := flag.Int("auto-aof-rewrite-percentage", 100, "rewrite the AOF after it grows by this percent since the last rewrite; 0 disables")
+	autoRewriteMin := flag.Int64("auto-aof-rewrite-min-size", 64<<20, "minimum AOF size in bytes before an automatic rewrite")
 	uiDir := flag.String("ui-dir", "", "optional directory to serve CacheScope static UI")
 	flag.Parse()
 
@@ -37,17 +39,22 @@ func main() {
 		log.Fatal(err)
 	}
 
-	c := cache.New(cache.Options{
-		MaxKeys:          *maxKeys,
-		MaxMemory:        *maxMemory,
-		MaxMemorySamples: *maxMemorySamples,
-		CleanupInterval:  *cleanupInterval,
-		EventLogSize:     *eventLogSize,
-		EvictionPolicy:   policy,
-		SnapshotPath:     *snapshotPath,
-		AppendLogPath:    *appendLogPath,
-		AppendFsync:      fsyncPolicy,
+	c, err := cache.Open(cache.Options{
+		MaxKeys:              *maxKeys,
+		MaxMemory:            *maxMemory,
+		MaxMemorySamples:     *maxMemorySamples,
+		CleanupInterval:      *cleanupInterval,
+		EventLogSize:         *eventLogSize,
+		EvictionPolicy:       policy,
+		SnapshotPath:         *snapshotPath,
+		AppendLogPath:        *appendLogPath,
+		AppendFsync:          fsyncPolicy,
+		AOFRewritePercentage: *autoRewritePct,
+		AOFRewriteMinSize:    *autoRewriteMin,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer c.Close()
 
 	server := &http.Server{

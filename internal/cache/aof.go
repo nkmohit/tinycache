@@ -3,6 +3,7 @@ package cache
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -22,8 +23,20 @@ const (
 	FsyncNo FsyncPolicy = "no"
 )
 
-// ErrInvalidFsync is returned when a policy string is not always, everysec, or no.
-var ErrInvalidFsync = errors.New("appendfsync must be always, everysec, or no")
+var (
+	// ErrInvalidFsync is returned when a policy string is not always, everysec, or no.
+	ErrInvalidFsync = errors.New("appendfsync must be always, everysec, or no")
+	// ErrCorruptAOF is returned when an append-only file has a bad record
+	// before the final line. A torn last line is truncated instead.
+	ErrCorruptAOF = errors.New("corrupt append-only file")
+	// ErrAOFRewriteInProgress is returned when a rewrite is already running.
+	ErrAOFRewriteInProgress = errors.New("aof rewrite already in progress")
+	// ErrCacheClosed is returned when a rewrite is requested after Close.
+	ErrCacheClosed = errors.New("cache is closed")
+)
+
+// aofInfof is the persistence log line. Tests replace it to read the text.
+var aofInfof = log.Printf
 
 // ParseFsyncPolicy accepts always, everysec, and no. An empty string is everysec.
 func ParseFsyncPolicy(value string) (FsyncPolicy, error) {
@@ -48,17 +61,42 @@ type syncWriter interface {
 type appendLogger struct {
 	mu       sync.Mutex
 	file     syncWriter
+	path     string
 	policy   FsyncPolicy
 	interval time.Duration
 	dirty    bool
 	err      error
+
+	// size is the byte length of the live file. baseSize is the length after
+	// the last rewrite, or at startup when no rewrite has run. Auto rewrite
+	// compares the two the way Redis compares aof_current_size with
+	// aof_rewrite_base_size.
+	size     int64
+	baseSize int64
+
+	percentage int
+	minSize    int64
+
+	// inProgress covers the whole rewrite, including the unlocked file build.
+	// rewriting is the window where new commands are also copied into rewriteBuf.
+	inProgress bool
+	rewriting  bool
+	rewriteBuf []byte
+	rewriteWG  sync.WaitGroup
+	closed     bool
 }
 
-func openAppendLogger(path string, policy FsyncPolicy) *appendLogger {
+func openAppendLogger(path string, policy FsyncPolicy, percentage int, minSize int64) *appendLogger {
 	if path == "" {
 		return nil
 	}
-	logger := &appendLogger{policy: policy, interval: time.Second}
+	logger := &appendLogger{
+		path:       path,
+		policy:     policy,
+		interval:   time.Second,
+		percentage: percentage,
+		minSize:    minSize,
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		log.Printf("tinycache aof: open %s: %v", path, err)
@@ -66,6 +104,10 @@ func openAppendLogger(path string, policy FsyncPolicy) *appendLogger {
 		return logger
 	}
 	logger.file = file
+	if fi, statErr := file.Stat(); statErr == nil {
+		logger.size = fi.Size()
+		logger.baseSize = fi.Size()
+	}
 	return logger
 }
 
@@ -82,12 +124,11 @@ func (a *appendLogger) write(record ReplayRecord) error {
 	if a == nil {
 		return nil
 	}
-	data, err := json.Marshal(record)
+	data, err := marshalRecord(record)
 	if err != nil {
 		log.Printf("tinycache aof: marshal: %v", err)
 		return err
 	}
-	data = append(data, '\n')
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -98,9 +139,17 @@ func (a *appendLogger) write(record ReplayRecord) error {
 	if a.file == nil {
 		return nil
 	}
-	if _, err := a.file.Write(data); err != nil {
+	n, err := a.file.Write(data)
+	if err != nil {
 		log.Printf("tinycache aof: write: %v", err)
 		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	a.size += int64(n)
+	if a.rewriting {
+		a.rewriteBuf = append(a.rewriteBuf, data...)
 	}
 	if a.policy == FsyncAlways {
 		if err := a.file.Sync(); err != nil {
@@ -113,6 +162,41 @@ func (a *appendLogger) write(record ReplayRecord) error {
 		a.dirty = true
 	}
 	return nil
+}
+
+func marshalRecord(record ReplayRecord) ([]byte, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, len(data)+1)
+	copy(buf, data)
+	buf[len(data)] = '\n'
+	return buf, nil
+}
+
+// commandRecord builds a log line. ExpiresAt is absolute so a replay after
+// downtime does not treat a dead key as a fresh TTL.
+func commandRecord(command, key, value string, expiresAt, at time.Time) ReplayRecord {
+	if !at.IsZero() {
+		at = at.UTC()
+	}
+	if !expiresAt.IsZero() {
+		expiresAt = expiresAt.UTC()
+	}
+	rec := ReplayRecord{
+		Command:   command,
+		Key:       key,
+		Value:     value,
+		ExpiresAt: expiresAt,
+		At:        at,
+	}
+	if !expiresAt.IsZero() && !at.IsZero() {
+		if secs := int64(expiresAt.Sub(at).Seconds()); secs > 0 {
+			rec.TTLSeconds = secs
+		}
+	}
+	return rec
 }
 
 // everySecLoop syncs a dirty log on each tick and once more when stop closes.
@@ -156,12 +240,25 @@ func (a *appendLogger) syncLocked() error {
 	return nil
 }
 
+func (a *appendLogger) syncFile() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.file == nil {
+		return nil
+	}
+	return a.file.Sync()
+}
+
 func (a *appendLogger) close() error {
 	if a == nil {
 		return nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.closed = true
 	syncErr := a.syncLocked()
 	if a.file == nil {
 		return syncErr
@@ -175,4 +272,108 @@ func (a *appendLogger) close() error {
 		return syncErr
 	}
 	return err
+}
+
+func (a *appendLogger) beginRewrite() error {
+	if a == nil || a.path == "" {
+		return ErrAppendLogPath
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return ErrCacheClosed
+	}
+	if a.inProgress {
+		return ErrAOFRewriteInProgress
+	}
+	if a.err != nil {
+		return a.err
+	}
+	if a.file == nil {
+		return ErrAppendLogPath
+	}
+	a.inProgress = true
+	a.rewriteWG.Add(1)
+	return nil
+}
+
+func (a *appendLogger) finishRewrite() {
+	a.mu.Lock()
+	// A failed rewrite may still be capturing. Drop that buffer: those
+	// commands are already on the previous file. A rewrite that published
+	// has already stopped capturing.
+	if a.rewriting {
+		a.rewriting = false
+		a.rewriteBuf = nil
+	}
+	a.inProgress = false
+	a.mu.Unlock()
+	a.rewriteWG.Done()
+}
+
+func (a *appendLogger) waitRewrite() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.closed = true
+	a.mu.Unlock()
+	a.rewriteWG.Wait()
+}
+
+func (a *appendLogger) needsRewrite() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.needsRewriteLocked()
+}
+
+func (a *appendLogger) needsRewriteLocked() bool {
+	if a.percentage <= 0 || a.file == nil || a.closed || a.inProgress || a.rewriting {
+		return false
+	}
+	if a.minSize > 0 && a.size < a.minSize {
+		return false
+	}
+	base := a.baseSize
+	if base < 1 {
+		base = 1
+	}
+	if a.size < base {
+		return false
+	}
+	growth := a.size - base
+	return growth*100 >= base*int64(a.percentage)
+}
+
+func (a *appendLogger) takeRewriteBuf() []byte {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	chunk := a.rewriteBuf
+	a.rewriteBuf = nil
+	return chunk
+}
+
+func (a *appendLogger) currentSize() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.size
+}
+
+func (a *appendLogger) setSize(n int64) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.size = n
+	a.baseSize = n
+	a.mu.Unlock()
 }
