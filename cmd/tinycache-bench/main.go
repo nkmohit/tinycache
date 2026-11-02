@@ -27,7 +27,7 @@ func main() {
 	operations := flag.Int("ops", 100000, "number of operations to run")
 	maxKeys := flag.Int("max-keys", 10000, "maximum keys in the benchmark cache")
 	writeRatio := flag.Float64("write-ratio", 0.30, "fraction of operations that are writes")
-	policy := flag.String("eviction-policy", "lru", "eviction policy: lru or lfu")
+	policyName := flag.String("eviction-policy", "lru", "eviction policy: lru, lfu, allkeys-lru, allkeys-lfu, allkeys-random, volatile-ttl, or noeviction")
 	flag.Parse()
 
 	if *operations <= 0 {
@@ -36,11 +36,15 @@ func main() {
 	if *writeRatio < 0 || *writeRatio > 1 {
 		log.Fatal("write-ratio must be between 0 and 1")
 	}
+	policy, err := cache.ParseEvictionPolicy(*policyName)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	c := cache.New(cache.Options{
 		MaxKeys:        *maxKeys,
 		EventLogSize:   0,
-		EvictionPolicy: cache.EvictionPolicy(*policy),
+		EvictionPolicy: policy,
 	})
 	defer c.Close()
 
@@ -66,7 +70,7 @@ func main() {
 	out := result{
 		Operations:     *operations,
 		MaxKeys:        *maxKeys,
-		EvictionPolicy: *policy,
+		EvictionPolicy: string(policy),
 		WriteRatio:     *writeRatio,
 		DurationMS:     elapsed.Milliseconds(),
 		OpsPerSecond:   float64(*operations) / elapsed.Seconds(),

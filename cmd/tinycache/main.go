@@ -16,29 +16,37 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
-	maxKeys := flag.Int("max-keys", 1000, "maximum number of keys before LRU eviction")
+	maxKeys := flag.Int("max-keys", 1000, "maximum number of keys; split evenly across shards")
+	maxMemory := flag.Int64("maxmemory", 0, "maximum approximate bytes (key+value+overhead); 0 means no byte limit")
+	maxMemorySamples := flag.Int("maxmemory-samples", 5, "keys sampled by approximate eviction (allkeys-lru, allkeys-lfu, volatile-ttl)")
 	cleanupInterval := flag.Duration("cleanup-interval", time.Second, "TTL cleanup interval")
 	eventLogSize := flag.Int("event-log-size", 1000, "number of recent debug events to retain")
-	evictionPolicy := flag.String("eviction-policy", "lru", "eviction policy: lru or lfu")
+	evictionPolicy := flag.String("eviction-policy", "lru", "eviction policy: lru, lfu, allkeys-lru, allkeys-lfu, allkeys-random, volatile-ttl, or noeviction")
 	snapshotPath := flag.String("snapshot-path", "", "optional JSON snapshot path to load on start and save through /admin/snapshot")
 	appendLogPath := flag.String("aof-path", "", "optional append-only operation log path")
 	appendFsync := flag.String("appendfsync", "everysec", "aof fsync policy: always, everysec, or no")
 	uiDir := flag.String("ui-dir", "", "optional directory to serve CacheScope static UI")
 	flag.Parse()
 
+	policy, err := cache.ParseEvictionPolicy(*evictionPolicy)
+	if err != nil {
+		log.Fatal(err)
+	}
 	fsyncPolicy, err := cache.ParseFsyncPolicy(*appendFsync)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	c := cache.New(cache.Options{
-		MaxKeys:         *maxKeys,
-		CleanupInterval: *cleanupInterval,
-		EventLogSize:    *eventLogSize,
-		EvictionPolicy:  cache.EvictionPolicy(*evictionPolicy),
-		SnapshotPath:    *snapshotPath,
-		AppendLogPath:   *appendLogPath,
-		AppendFsync:     fsyncPolicy,
+		MaxKeys:          *maxKeys,
+		MaxMemory:        *maxMemory,
+		MaxMemorySamples: *maxMemorySamples,
+		CleanupInterval:  *cleanupInterval,
+		EventLogSize:     *eventLogSize,
+		EvictionPolicy:   policy,
+		SnapshotPath:     *snapshotPath,
+		AppendLogPath:    *appendLogPath,
+		AppendFsync:      fsyncPolicy,
 	})
 	defer c.Close()
 

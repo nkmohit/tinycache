@@ -10,7 +10,8 @@ TinyCache is a Redis-inspired in-memory cache engine with HTTP commands and debu
 
 - HTTP cache commands: `SET`, `GET`, `DEL`, `EXPIRE`, `TTL`.
 - TTL cleanup with lazy expiration on read and a Redis-style background sweeper.
-- LRU and LFU eviction modes.
+- Exact LRU and LFU, plus approximate `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, and `volatile-ttl`. `noeviction` returns an OOM error.
+- A key-count limit and a `maxmemory` byte limit. Each is split across the shards.
 - Metrics with hit ratio, memory estimate, evictions, and latency percentiles.
 - Debug endpoints for keys, LRU order, events, replay records, and one-call UI hydration.
 - JSON snapshot persistence and an append-only log with `always`, `everysec`, or `no` fsync.
@@ -29,6 +30,8 @@ Optional flags:
 go run ./cmd/tinycache \
   --addr :8080 \
   --max-keys 1000 \
+  --maxmemory 0 \
+  --maxmemory-samples 5 \
   --cleanup-interval 1s \
   --event-log-size 1000 \
   --eviction-policy lru \
@@ -133,13 +136,36 @@ LFU was still scanning every resident key to pick a victim. Frequency buckets an
 | `BenchmarkSet` (single goroutine) | 852 ns/op | 1,040 ns/op |
 | `BenchmarkGetHit` (one hot key) | 295 ns/op | 289 ns/op |
 
+That single-threaded slowdown was the admission lock and the 16-shard lock on eviction. Giving each shard its own budget removes both. Median of three runs on this VM, immediately before the change and after it:
+
+| | before | after |
+| --- | ---: | ---: |
+| `BenchmarkSet` | 1,068 ns/op (936,330 ops/s) | 898 ns/op (1,113,586 ops/s) |
+| `BenchmarkEvictLRU` | 1,008 ns/op | 746 ns/op |
+| `BenchmarkEvictLFU` | 1,041 ns/op | 779 ns/op |
+| `BenchmarkGetHit` | 297 ns/op | 306 ns/op |
+| bench CLI, LRU, 100k ops, 10k keys, 30% writes | 1,651,650 ops/s | 1,788,250 ops/s |
+| bench CLI, LFU, same workload | 1,451,155 ops/s | 1,587,813 ops/s |
+
 ## Design tradeoffs
 
 ### Locking on GET, and sharding
 
 A GET updates recency (and, for LFU, the frequency bucket), so it takes the write lock of the shard that owns the key. There are 16 shards, and each key hashes to one of them. GETs of different keys take different locks. Operations on one key still run one at a time. A single hot key still takes one shard lock, which is why `BenchmarkGetHit` stayed near 290 ns/op while `BenchmarkGetHitParallel` went from 1,007 ns/op to 768 ns/op.
 
-The key limit is global. An insert that has to evict takes an admission lock and then every shard lock, in index order, and compares the 16 local victims. GETs do not take the admission lock. The extra lock shows up when one goroutine is already the only writer: single-threaded `BenchmarkSet` went from 852 ns/op to 1,040 ns/op, and the LRU bench CLI from 1,987,993 ops/s to 1,761,864 ops/s.
+### Per-shard capacity
+
+`maxKeys` and `maxmemory` are divided by 16. The first remainder shards get one extra key or one extra byte, and the shares sum to the configured total. A write locks only the shard that owns the key. If that shard is over its own budget it evicts one of its own keys.
+
+The tradeoff is skew. Keys that hash onto one shard evict there while other shards still have free slots, so the process can hold fewer keys than `maxKeys`. At 10,000 keys the share is 625 and a uniform hash stays close to that. Below 16 keys some shards get a share of zero and a new key on one of those shards returns an OOM error.
+
+`maxmemory` counts key bytes plus value bytes plus 128 bytes of overhead per entry. It is an estimate, not a read of the heap. Zero means no byte limit. The key limit still applies.
+
+### Exact and sampled eviction
+
+`lru` and `lfu` are exact inside the shard: the LRU tail, or the tail of the lowest frequency bucket. `allkeys-lru` draws `maxmemory-samples` keys (default 5) and evicts the one with the oldest LRU clock, the Unix second of the last access. `allkeys-lfu` draws the same sample and evicts the lowest logarithmic counter. That counter starts at 5, increments with probability `1/(base*10+1)`, and drops by one per idle minute (Redis `lfu-log-factor` 10 and `lfu-decay-time` 1). `allkeys-random` deletes one random key. `volatile-ttl` samples only keys that expire and deletes the soonest. It returns an OOM error when the shard has no expiring key. `noeviction` returns that error when the shard is at either limit.
+
+A sample can miss the coldest key and keep it. Exact mode evicts that key. Exact LFU still keeps the per-frequency lists. Sampled policies skip that second list element.
 
 ### LFU buckets
 

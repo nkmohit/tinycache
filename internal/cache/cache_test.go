@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +15,7 @@ import (
 )
 
 func TestSetGetHit(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10})
+	c := newTestCache(t, Options{MaxKeys: 64})
 
 	if err := c.Set(context.Background(), "name", "tiny", 0); err != nil {
 		t.Fatalf("set failed: %v", err)
@@ -29,7 +30,7 @@ func TestSetGetHit(t *testing.T) {
 }
 
 func TestGetMissingIncrementsMiss(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10})
+	c := newTestCache(t, Options{MaxKeys: 64})
 
 	result, err := c.Get(context.Background(), "missing")
 	if err != nil {
@@ -44,7 +45,7 @@ func TestGetMissingIncrementsMiss(t *testing.T) {
 }
 
 func TestDeleteRemovesKey(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10})
+	c := newTestCache(t, Options{MaxKeys: 64})
 
 	if err := c.Set(context.Background(), "name", "tiny", 0); err != nil {
 		t.Fatalf("set failed: %v", err)
@@ -66,7 +67,7 @@ func TestDeleteRemovesKey(t *testing.T) {
 }
 
 func TestExpireUpdatesTTL(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10})
+	c := newTestCache(t, Options{MaxKeys: 64})
 
 	if err := c.Set(context.Background(), "name", "tiny", 0); err != nil {
 		t.Fatalf("set failed: %v", err)
@@ -88,7 +89,7 @@ func TestExpireUpdatesTTL(t *testing.T) {
 }
 
 func TestTTLStates(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10})
+	c := newTestCache(t, Options{MaxKeys: 64})
 
 	if ttl, err := c.TTL(context.Background(), "missing"); err != nil || ttl != TTLMissing {
 		t.Fatalf("expected missing ttl -2, got ttl=%d err=%v", ttl, err)
@@ -108,7 +109,7 @@ func TestTTLStates(t *testing.T) {
 }
 
 func TestLazyExpiration(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10, CleanupInterval: time.Hour})
+	c := newTestCache(t, Options{MaxKeys: 64, CleanupInterval: time.Hour})
 
 	if err := c.Set(context.Background(), "short", "value", 20*time.Millisecond); err != nil {
 		t.Fatalf("set failed: %v", err)
@@ -128,7 +129,7 @@ func TestLazyExpiration(t *testing.T) {
 }
 
 func TestBackgroundCleanup(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10, CleanupInterval: 10 * time.Millisecond})
+	c := newTestCache(t, Options{MaxKeys: 64, CleanupInterval: 10 * time.Millisecond})
 
 	if err := c.Set(context.Background(), "short", "value", 10*time.Millisecond); err != nil {
 		t.Fatalf("set failed: %v", err)
@@ -141,7 +142,7 @@ func TestBackgroundCleanup(t *testing.T) {
 }
 
 func TestExpiredKeysAreNeverReturned(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 20, CleanupInterval: time.Hour})
+	c := newTestCache(t, Options{MaxKeys: 64, CleanupInterval: time.Hour})
 	ctx := context.Background()
 	for _, key := range []string{"get", "ttl", "expire", "snapshot", "lru"} {
 		if err := c.Set(ctx, key, "secret-"+key, 20*time.Millisecond); err != nil {
@@ -194,7 +195,7 @@ func TestExpiredKeysAreNeverReturned(t *testing.T) {
 }
 
 func TestSetDoesNotScanForExpiredKeys(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10, CleanupInterval: time.Hour})
+	c := newTestCache(t, Options{MaxKeys: 64, CleanupInterval: time.Hour})
 	ctx := context.Background()
 	if err := c.Set(ctx, "old", "gone", 15*time.Millisecond); err != nil {
 		t.Fatalf("set old: %v", err)
@@ -301,110 +302,111 @@ func TestSweeperEventuallyReclaims(t *testing.T) {
 }
 
 func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 2, EventLogSize: 10})
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EventLogSize: 10})
+	keys := keysOnShard(t, 0, 3)
+	a, b, fresh := keys[0], keys[1], keys[2]
 
-	mustSet(t, c, "a", "1")
-	mustSet(t, c, "b", "2")
-	if _, err := c.Get(context.Background(), "a"); err != nil {
+	mustSet(t, c, a, "1")
+	mustSet(t, c, b, "2")
+	if _, err := c.Get(context.Background(), a); err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	mustSet(t, c, "c", "3")
+	mustSet(t, c, fresh, "3")
 
-	if result, _ := c.Get(context.Background(), "b"); result.Hit {
-		t.Fatal("expected b to be evicted")
-	}
-	if result, _ := c.Get(context.Background(), "a"); !result.Hit {
-		t.Fatal("expected a to remain")
-	}
-	if result, _ := c.Get(context.Background(), "c"); !result.Hit {
-		t.Fatal("expected c to remain")
-	}
+	assertMissing(t, c, b)
+	assertHit(t, c, a, "1")
+	assertHit(t, c, fresh, "3")
 	if got := c.Metrics().Evictions; got != 1 {
 		t.Fatalf("expected 1 eviction, got %d", got)
 	}
+	assertKeyIndex(t, c)
 }
 
 func TestLFUEvictsLeastFrequentlyUsed(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU})
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionLFU})
+	keys := keysOnShard(t, 0, 3)
+	a, b, fresh := keys[0], keys[1], keys[2]
 
-	mustSet(t, c, "a", "1")
-	mustSet(t, c, "b", "2")
+	mustSet(t, c, a, "1")
+	mustSet(t, c, b, "2")
 	for i := 0; i < 4; i++ {
-		if _, err := c.Get(context.Background(), "a"); err != nil {
+		if _, err := c.Get(context.Background(), a); err != nil {
 			t.Fatalf("get a failed: %v", err)
 		}
 	}
-	if _, err := c.Get(context.Background(), "b"); err != nil {
+	if _, err := c.Get(context.Background(), b); err != nil {
 		t.Fatalf("get b failed: %v", err)
 	}
-	mustSet(t, c, "c", "3")
+	mustSet(t, c, fresh, "3")
 
-	if result, _ := c.Get(context.Background(), "b"); result.Hit {
-		t.Fatal("expected b to be evicted by LFU")
-	}
-	if result, _ := c.Get(context.Background(), "a"); !result.Hit {
-		t.Fatal("expected frequently used a to remain")
-	}
+	assertMissing(t, c, b)
+	assertHit(t, c, a, "1")
 	assertLFUBuckets(t, c)
 }
 
 func TestLFUEvictsInFrequencyThenRecencyOrder(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 3, EvictionPolicy: EvictionLFU})
+	c := newTestCache(t, Options{MaxKeys: evenCap(3), EvictionPolicy: EvictionLFU})
 	ctx := context.Background()
+	keys := keysOnShard(t, 0, 5)
+	a, b, cold, d, e := keys[0], keys[1], keys[2], keys[3], keys[4]
 
-	mustSet(t, c, "a", "1")
-	mustSet(t, c, "b", "2")
-	mustSet(t, c, "c", "3")
+	mustSet(t, c, a, "1")
+	mustSet(t, c, b, "2")
+	mustSet(t, c, cold, "3")
 	for i := 0; i < 3; i++ {
-		if _, err := c.Get(ctx, "a"); err != nil {
+		if _, err := c.Get(ctx, a); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := c.Get(ctx, "b"); err != nil {
+	if _, err := c.Get(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	// Frequencies: a=3, b=1, c=0. c is the least used.
-	mustSet(t, c, "d", "4")
-	assertMissing(t, c, "c")
-	assertHit(t, c, "a", "1")
-	assertHit(t, c, "b", "2")
-	assertHit(t, c, "d", "4")
+	// Frequencies: a=3, b=1, cold=0. cold is the least used.
+	mustSet(t, c, d, "4")
+	assertMissing(t, c, cold)
+	assertHit(t, c, a, "1")
+	assertHit(t, c, b, "2")
+	assertHit(t, c, d, "4")
 	assertLFUBuckets(t, c)
 
 	// d is the only frequency-0 key.
-	mustSet(t, c, "e", "5")
-	assertMissing(t, c, "d")
-	assertHit(t, c, "a", "1")
-	assertHit(t, c, "b", "2")
+	mustSet(t, c, e, "5")
+	assertMissing(t, c, d)
+	assertHit(t, c, a, "1")
+	assertHit(t, c, b, "2")
 	assertLFUBuckets(t, c)
 
 	// Same frequency: the older access loses. Stamp the times so the result
-	// does not depend on the clock resolution or which shard each key hits.
-	tied := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU})
-	mustSet(t, tied, "older", "1")
-	mustSet(t, tied, "newer", "2")
-	if _, err := tied.Get(ctx, "older"); err != nil {
+	// does not depend on the clock resolution.
+	tied := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionLFU})
+	pair := keysOnShard(t, 0, 3)
+	older, newer, fresh := pair[0], pair[1], pair[2]
+	mustSet(t, tied, older, "1")
+	mustSet(t, tied, newer, "2")
+	if _, err := tied.Get(ctx, older); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tied.Get(ctx, "newer"); err != nil {
+	if _, err := tied.Get(ctx, newer); err != nil {
 		t.Fatal(err)
 	}
-	stampAccess(t, tied, "older", time.Unix(10, 0).UTC(), false)
-	stampAccess(t, tied, "newer", time.Unix(20, 0).UTC(), true)
-	mustSet(t, tied, "fresh", "3")
-	assertMissing(t, tied, "older")
-	assertHit(t, tied, "newer", "2")
-	assertHit(t, tied, "fresh", "3")
+	stampAccess(t, tied, older, time.Unix(10, 0).UTC(), false)
+	stampAccess(t, tied, newer, time.Unix(20, 0).UTC(), true)
+	mustSet(t, tied, fresh, "3")
+	assertMissing(t, tied, older)
+	assertHit(t, tied, newer, "2")
+	assertHit(t, tied, fresh, "3")
 	assertLFUBuckets(t, tied)
 }
 
 func TestLFUSnapshotRestoresFrequency(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tinycache.snapshot.json")
-	c := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU, SnapshotPath: path})
-	mustSet(t, c, "hot", "1")
-	mustSet(t, c, "cold", "2")
+	keys := keysOnShard(t, 0, 3)
+	hot, cold, fresh := keys[0], keys[1], keys[2]
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionLFU, SnapshotPath: path})
+	mustSet(t, c, hot, "1")
+	mustSet(t, c, cold, "2")
 	for i := 0; i < 3; i++ {
-		if _, err := c.Get(context.Background(), "hot"); err != nil {
+		if _, err := c.Get(context.Background(), hot); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -413,16 +415,24 @@ func TestLFUSnapshotRestoresFrequency(t *testing.T) {
 	}
 	c.Close()
 
-	loaded := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU, SnapshotPath: path})
-	mustSet(t, loaded, "new", "3")
-	assertMissing(t, loaded, "cold")
-	assertHit(t, loaded, "hot", "1")
+	loaded := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionLFU, SnapshotPath: path})
+	mustSet(t, loaded, fresh, "3")
+	assertMissing(t, loaded, cold)
+	assertHit(t, loaded, hot, "1")
 	assertLFUBuckets(t, loaded)
 }
 
 func TestConcurrentAccessUnderEviction(t *testing.T) {
 	ctx := context.Background()
-	for _, policy := range []EvictionPolicy{EvictionLRU, EvictionLFU} {
+	for _, policy := range []EvictionPolicy{
+		EvictionLRU,
+		EvictionLFU,
+		EvictionAllKeysLRU,
+		EvictionAllKeysLFU,
+		EvictionAllKeysRandom,
+		EvictionVolatileTTL,
+		EvictionNoEviction,
+	} {
 		t.Run(string(policy), func(t *testing.T) {
 			c := newTestCache(t, Options{MaxKeys: 32, EvictionPolicy: policy, CleanupInterval: time.Hour})
 			var wg sync.WaitGroup
@@ -447,6 +457,8 @@ func TestConcurrentAccessUnderEviction(t *testing.T) {
 				t.Fatalf("key count %d out of range", got)
 			}
 			assertKeyCount(t, c)
+			assertKeyIndex(t, c)
+			assertMemory(t, c)
 			if policy == EvictionLFU {
 				assertLFUBuckets(t, c)
 			}
@@ -455,7 +467,7 @@ func TestConcurrentAccessUnderEviction(t *testing.T) {
 }
 
 func TestUpdateExistingKeyDoesNotIncreaseKeyCount(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 1})
+	c := newTestCache(t, Options{MaxKeys: shardCount})
 
 	mustSet(t, c, "a", "1")
 	mustSet(t, c, "a", "2")
@@ -491,7 +503,7 @@ func TestConcurrentAccess(t *testing.T) {
 }
 
 func TestSnapshotKeysFiltersSortsAndLimits(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 10})
+	c := newTestCache(t, Options{MaxKeys: 64})
 
 	mustSet(t, c, "session:1", "value")
 	mustSet(t, c, "session:2", "larger-value")
@@ -513,13 +525,13 @@ func TestSnapshotKeysFiltersSortsAndLimits(t *testing.T) {
 
 func TestSaveAndLoadSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tinycache.snapshot.json")
-	c := newTestCache(t, Options{MaxKeys: 10, SnapshotPath: path})
+	c := newTestCache(t, Options{MaxKeys: 64, SnapshotPath: path})
 	mustSet(t, c, "name", "tiny")
 
 	if err := c.SaveSnapshot(""); err != nil {
 		t.Fatalf("save snapshot failed: %v", err)
 	}
-	loaded := newTestCache(t, Options{MaxKeys: 10, SnapshotPath: path})
+	loaded := newTestCache(t, Options{MaxKeys: 64, SnapshotPath: path})
 	result, err := loaded.Get(context.Background(), "name")
 	if err != nil {
 		t.Fatalf("get loaded key failed: %v", err)
@@ -531,7 +543,7 @@ func TestSaveAndLoadSnapshot(t *testing.T) {
 
 func TestAppendLogReplayRecords(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tinycache.aof")
-	c := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path})
+	c := newTestCache(t, Options{MaxKeys: 64, AppendLogPath: path})
 
 	mustSet(t, c, "name", "tiny")
 	if updated, err := c.Expire(context.Background(), "name", 30*time.Second); err != nil || !updated {
@@ -559,7 +571,7 @@ func TestAppendLogReplayRecords(t *testing.T) {
 
 func TestAOFWriteErrorSurfaces(t *testing.T) {
 	c := newTestCache(t, Options{
-		MaxKeys:       4,
+		MaxKeys:       64,
 		AppendLogPath: filepath.Join(t.TempDir(), "tinycache.aof"),
 		AppendFsync:   FsyncNo,
 	})
@@ -584,7 +596,7 @@ func TestAOFDeviceWriteErrorSurfaces(t *testing.T) {
 		t.Skip("/dev/full is not available")
 	}
 	c := newTestCache(t, Options{
-		MaxKeys:       4,
+		MaxKeys:       64,
 		AppendLogPath: "/dev/full",
 		AppendFsync:   FsyncNo,
 	})
@@ -595,7 +607,7 @@ func TestAOFDeviceWriteErrorSurfaces(t *testing.T) {
 }
 
 func TestAOFOpenErrorSurfaces(t *testing.T) {
-	c := newTestCache(t, Options{MaxKeys: 4, AppendLogPath: t.TempDir(), AppendFsync: FsyncNo})
+	c := newTestCache(t, Options{MaxKeys: 64, AppendLogPath: t.TempDir(), AppendFsync: FsyncNo})
 	err := c.Set(context.Background(), "name", "tiny", 0)
 	if err == nil {
 		t.Fatal("expected append log open error to surface on set")
@@ -604,7 +616,7 @@ func TestAOFOpenErrorSurfaces(t *testing.T) {
 
 func TestAppendFsyncAlwaysSyncsEachWrite(t *testing.T) {
 	c := newTestCache(t, Options{
-		MaxKeys:       4,
+		MaxKeys:       64,
 		AppendLogPath: filepath.Join(t.TempDir(), "tinycache.aof"),
 		AppendFsync:   FsyncAlways,
 	})
@@ -692,7 +704,7 @@ func TestAppendFsyncEverySecTicksAndShutsDown(t *testing.T) {
 
 func TestAOFReplayAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tinycache.aof")
-	c := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path, AppendFsync: FsyncAlways})
+	c := newTestCache(t, Options{MaxKeys: 64, AppendLogPath: path, AppendFsync: FsyncAlways})
 	mustSet(t, c, "name", "tiny")
 	if updated, err := c.Expire(context.Background(), "name", 30*time.Second); err != nil || !updated {
 		t.Fatalf("expire updated=%v err=%v", updated, err)
@@ -702,7 +714,7 @@ func TestAOFReplayAfterRestart(t *testing.T) {
 	}
 	c.Close()
 
-	restarted := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path, AppendFsync: FsyncEverySec})
+	restarted := newTestCache(t, Options{MaxKeys: 64, AppendLogPath: path, AppendFsync: FsyncEverySec})
 	records, err := restarted.ReplayRecords()
 	if err != nil {
 		t.Fatalf("replay records: %v", err)
@@ -711,7 +723,7 @@ func TestAOFReplayAfterRestart(t *testing.T) {
 		t.Fatalf("unexpected records: %#v", records)
 	}
 
-	replayed := newTestCache(t, Options{MaxKeys: 10})
+	replayed := newTestCache(t, Options{MaxKeys: 64})
 	for _, record := range records {
 		switch record.Command {
 		case "set":
@@ -783,6 +795,408 @@ func (w errSyncWriter) Write([]byte) (int, error) { return 0, w.err }
 func (w errSyncWriter) Sync() error               { return nil }
 func (w errSyncWriter) Close() error              { return nil }
 
+func TestShardCapacityRemainderSpread(t *testing.T) {
+	const keyTotal = shardCount + 3
+	const memTotal = int64(shardCount)*10 + 4
+	c := newTestCache(t, Options{MaxKeys: keyTotal, MaxMemory: memTotal})
+	var keys int
+	var mem int64
+	for i := range c.shards {
+		keys += c.shards[i].maxKeys
+		mem += c.shards[i].maxMemory
+		wantKeys := 1
+		if i < 3 {
+			wantKeys = 2
+		}
+		if c.shards[i].maxKeys != wantKeys {
+			t.Fatalf("shard %d maxKeys=%d want %d", i, c.shards[i].maxKeys, wantKeys)
+		}
+		wantMem := int64(10)
+		if i < 4 {
+			wantMem = 11
+		}
+		if c.shards[i].maxMemory != wantMem {
+			t.Fatalf("shard %d maxMemory=%d want %d", i, c.shards[i].maxMemory, wantMem)
+		}
+	}
+	if keys != keyTotal || mem != memTotal {
+		t.Fatalf("spread keys=%d mem=%d", keys, mem)
+	}
+}
+
+func TestPerShardEvictionLeavesOtherShards(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: evenCap(1)})
+	hot := keysOnShard(t, 0, 2)
+	cold := keysOnShard(t, 1, 1)
+	mustSet(t, c, hot[0], "a")
+	mustSet(t, c, cold[0], "b")
+	mustSet(t, c, hot[1], "a2")
+	assertMissing(t, c, hot[0])
+	assertHit(t, c, hot[1], "a2")
+	assertHit(t, c, cold[0], "b")
+	if got := c.Metrics().KeyCount; got != 2 {
+		t.Fatalf("key count=%d want 2", got)
+	}
+}
+
+func TestExactLRUIgnoresClock(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionLRU, MaxMemorySamples: 20})
+	keys := keysOnShard(t, 0, 3)
+	a, b, fresh := keys[0], keys[1], keys[2]
+	mustSet(t, c, a, "1")
+	mustSet(t, c, b, "2")
+	if _, err := c.Get(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	// a is the list head. Its clock is ancient; exact LRU still keeps it.
+	setClock(t, c, a, 1)
+	setClock(t, c, b, 100)
+	mustSet(t, c, fresh, "3")
+	assertMissing(t, c, b)
+	assertHit(t, c, a, "1")
+	assertHit(t, c, fresh, "3")
+}
+
+func TestAllKeysLRUEvictsOldestClock(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionAllKeysLRU, MaxMemorySamples: 20})
+	keys := keysOnShard(t, 0, 3)
+	a, b, fresh := keys[0], keys[1], keys[2]
+	mustSet(t, c, a, "1")
+	mustSet(t, c, b, "2")
+	if _, err := c.Get(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	setClock(t, c, a, 1)
+	setClock(t, c, b, 100)
+	mustSet(t, c, fresh, "3")
+	assertMissing(t, c, a)
+	assertHit(t, c, b, "2")
+	assertHit(t, c, fresh, "3")
+}
+
+func TestAllKeysLFUEvictsLowestCounter(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionAllKeysLFU, MaxMemorySamples: 20})
+	keys := keysOnShard(t, 0, 3)
+	cold, hot, fresh := keys[0], keys[1], keys[2]
+	mustSet(t, c, cold, "1")
+	mustSet(t, c, hot, "2")
+	nowMin := time.Now().UTC().Unix() / 60
+	setLFU(t, c, cold, 1, nowMin)
+	setLFU(t, c, hot, 100, nowMin)
+	mustSet(t, c, fresh, "3")
+	assertMissing(t, c, cold)
+	assertHit(t, c, hot, "2")
+	assertHit(t, c, fresh, "3")
+}
+
+func TestAllKeysLFUCounterDecays(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionAllKeysLFU, MaxMemorySamples: 20})
+	keys := keysOnShard(t, 0, 3)
+	idle, freshHit, fresh := keys[0], keys[1], keys[2]
+	mustSet(t, c, idle, "1")
+	mustSet(t, c, freshHit, "2")
+	nowMin := time.Now().UTC().Unix() / 60
+	// 30 idle minutes drops a counter of 20 to 0. The fresh counter stays at 5.
+	setLFU(t, c, idle, 20, nowMin-30)
+	setLFU(t, c, freshHit, 5, nowMin)
+	mustSet(t, c, fresh, "3")
+	assertMissing(t, c, idle)
+	assertHit(t, c, freshHit, "2")
+}
+
+func TestLFULogIncrementAndDecay(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	counter := uint8(0)
+	for counter <= lfuInitVal {
+		next := lfuLogIncr(counter, rng)
+		if next != counter+1 {
+			t.Fatalf("counter %d incremented to %d, want %d", counter, next, counter+1)
+		}
+		counter = next
+	}
+	stayed := 0
+	for i := 0; i < 200; i++ {
+		if lfuLogIncr(counter, rng) == counter {
+			stayed++
+		}
+	}
+	if stayed == 0 {
+		t.Fatal("log counter incremented on every hit above the init value")
+	}
+
+	now := time.Now().UTC()
+	st := lfuState{log: 20, decay: now.Unix()/60 - 30}
+	if got := st.decayed(now); got != 0 {
+		t.Fatalf("decayed counter=%d want 0", got)
+	}
+	st = lfuState{log: 40, decay: now.Unix()/60 - 5}
+	if got := st.decayed(now); got != 35 {
+		t.Fatalf("decayed counter=%d want 35", got)
+	}
+}
+
+func TestAllKeysRandomEvictsAnyResident(t *testing.T) {
+	keys := keysOnShard(t, 0, 3)
+	evicted := map[string]int{}
+	for trial := 0; trial < 40; trial++ {
+		c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionAllKeysRandom})
+		mustSet(t, c, keys[0], "1")
+		mustSet(t, c, keys[1], "2")
+		mustSet(t, c, keys[2], "3")
+		missing := 0
+		for _, key := range keys[:2] {
+			result, err := c.Get(context.Background(), key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Hit {
+				missing++
+				evicted[key]++
+			}
+		}
+		if missing != 1 {
+			t.Fatalf("trial %d missing=%d", trial, missing)
+		}
+		assertHit(t, c, keys[2], "3")
+		if got := c.Metrics().KeyCount; got != 2 {
+			t.Fatalf("key count=%d", got)
+		}
+	}
+	if len(evicted) < 2 {
+		t.Fatalf("random policy evicted only %v", evicted)
+	}
+}
+
+func TestVolatileTTLEvictsSoonestAndSkipsPersistent(t *testing.T) {
+	c := newTestCache(t, Options{
+		MaxKeys:          evenCap(3),
+		EvictionPolicy:   EvictionVolatileTTL,
+		MaxMemorySamples: 20,
+		CleanupInterval:  time.Hour,
+	})
+	keys := keysOnShard(t, 0, 4)
+	immortal, soon, later, fresh := keys[0], keys[1], keys[2], keys[3]
+	mustSet(t, c, immortal, "keep")
+	mustSetTTL(t, c, soon, "s", time.Second)
+	mustSetTTL(t, c, later, "l", time.Hour)
+	mustSetTTL(t, c, fresh, "f", time.Hour)
+	assertMissing(t, c, soon)
+	assertHit(t, c, immortal, "keep")
+	assertHit(t, c, later, "l")
+	assertHit(t, c, fresh, "f")
+}
+
+func TestVolatileTTLReturnsOOMWhenNothingExpires(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: evenCap(1), EvictionPolicy: EvictionVolatileTTL})
+	keys := keysOnShard(t, 0, 2)
+	mustSet(t, c, keys[0], "keep")
+	err := c.Set(context.Background(), keys[1], "nope", 0)
+	if !errors.Is(err, ErrOOM) {
+		t.Fatalf("expected OOM, got %v", err)
+	}
+	assertHit(t, c, keys[0], "keep")
+	if got := c.Metrics().Evictions; got != 0 {
+		t.Fatalf("evictions=%d", got)
+	}
+}
+
+func TestNoEvictionReturnsOOM(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: evenCap(2), EvictionPolicy: EvictionNoEviction})
+	keys := keysOnShard(t, 0, 3)
+	mustSet(t, c, keys[0], "1")
+	mustSet(t, c, keys[1], "2")
+	err := c.Set(context.Background(), keys[2], "3", 0)
+	if !errors.Is(err, ErrOOM) {
+		t.Fatalf("expected OOM, got %v", err)
+	}
+	assertHit(t, c, keys[0], "1")
+	assertHit(t, c, keys[1], "2")
+	assertMissing(t, c, keys[2])
+	if got := c.Metrics().Evictions; got != 0 {
+		t.Fatalf("evictions=%d", got)
+	}
+	mustSet(t, c, keys[0], "updated")
+	assertHit(t, c, keys[0], "updated")
+	if got := c.Metrics().KeyCount; got != 2 {
+		t.Fatalf("key count=%d", got)
+	}
+}
+
+func TestMaxMemoryEvictsWithinShard(t *testing.T) {
+	keys := keysOnShard(t, 0, 2)
+	other := keysOnShard(t, 1, 1)
+	one := estimateSize(keys[0], "v")
+	c := newTestCache(t, Options{
+		MaxKeys:        evenCap(8),
+		MaxMemory:      one * shardCount,
+		EvictionPolicy: EvictionLRU,
+	})
+	mustSet(t, c, keys[0], "v")
+	mustSet(t, c, keys[1], "v")
+	assertMissing(t, c, keys[0])
+	assertHit(t, c, keys[1], "v")
+	mustSet(t, c, other[0], "v")
+	assertHit(t, c, other[0], "v")
+	if got := c.Metrics().MemoryBytes; got != one*2 {
+		t.Fatalf("memory=%d want %d", got, one*2)
+	}
+	assertMemory(t, c)
+}
+
+func TestMaxMemoryRejectsOversizedValue(t *testing.T) {
+	keys := keysOnShard(t, 0, 1)
+	one := estimateSize(keys[0], "v")
+	c := newTestCache(t, Options{
+		MaxKeys:        evenCap(4),
+		MaxMemory:      one * shardCount,
+		EvictionPolicy: EvictionLRU,
+	})
+	mustSet(t, c, keys[0], "v")
+	big := strings.Repeat("x", int(one))
+	err := c.Set(context.Background(), keys[0], big, 0)
+	if !errors.Is(err, ErrOOM) {
+		t.Fatalf("expected OOM, got %v", err)
+	}
+	assertHit(t, c, keys[0], "v")
+	if got := c.Metrics().Evictions; got != 0 {
+		t.Fatalf("oversized write evicted %d keys", got)
+	}
+}
+
+func TestMaxMemoryUpdateEvictsNeighbor(t *testing.T) {
+	keys := keysOnShard(t, 0, 2)
+	small := estimateSize(keys[0], "v")
+	budget := small * 2
+	c := newTestCache(t, Options{
+		MaxKeys:        evenCap(8),
+		MaxMemory:      budget * shardCount,
+		EvictionPolicy: EvictionLRU,
+	})
+	mustSet(t, c, keys[0], "v")
+	mustSet(t, c, keys[1], "v")
+	need := int(budget - int64(len(keys[0])) - perEntryOverhead)
+	if need <= 0 {
+		t.Fatalf("value length %d", need)
+	}
+	mustSet(t, c, keys[0], strings.Repeat("y", need))
+	assertMissing(t, c, keys[1])
+	assertHit(t, c, keys[0], strings.Repeat("y", need))
+	assertMemory(t, c)
+}
+
+func TestNoEvictionMaxMemoryRejectsGrowth(t *testing.T) {
+	keys := keysOnShard(t, 0, 2)
+	small := estimateSize(keys[0], "v")
+	c := newTestCache(t, Options{
+		MaxKeys:        evenCap(8),
+		MaxMemory:      small * 2 * shardCount,
+		EvictionPolicy: EvictionNoEviction,
+	})
+	mustSet(t, c, keys[0], "v")
+	mustSet(t, c, keys[1], "v")
+	big := strings.Repeat("z", int(small))
+	err := c.Set(context.Background(), keys[0], big, 0)
+	if !errors.Is(err, ErrOOM) {
+		t.Fatalf("expected OOM, got %v", err)
+	}
+	assertHit(t, c, keys[0], "v")
+	assertHit(t, c, keys[1], "v")
+	if got := c.Metrics().Evictions; got != 0 {
+		t.Fatalf("evictions=%d", got)
+	}
+}
+
+func TestConcurrentMaxMemory(t *testing.T) {
+	one := estimateSize("key-00", "v")
+	c := newTestCache(t, Options{
+		MaxKeys:         evenCap(32),
+		MaxMemory:       one * 4 * shardCount,
+		EvictionPolicy:  EvictionAllKeysLRU,
+		CleanupInterval: time.Hour,
+	})
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 80; i++ {
+				key := fmt.Sprintf("key-%02d", (g*3+i)%40)
+				_ = c.Set(ctx, key, "v", 0)
+				_, _ = c.Get(ctx, key)
+				if i%4 == 0 {
+					_, _ = c.Delete(ctx, key)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	assertKeyCount(t, c)
+	assertKeyIndex(t, c)
+	assertMemory(t, c)
+	if got := c.Metrics().MemoryBytes; got < 0 || got > one*4*shardCount {
+		t.Fatalf("memory=%d over budget %d", got, one*4*shardCount)
+	}
+}
+
+func TestShardSkewEvictsBelowGlobalCap(t *testing.T) {
+	const n = 20000
+	c := newTestCache(t, Options{MaxKeys: n + 1, CleanupInterval: time.Hour})
+	for i := 0; i < n; i++ {
+		if err := c.Set(context.Background(), fmt.Sprintf("key-%d", i), "value", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metrics := c.Metrics()
+	if metrics.Evictions == 0 {
+		t.Fatal("expected hash skew to fill at least one shard before the global cap")
+	}
+	if metrics.KeyCount >= n {
+		t.Fatalf("key count %d, want fewer than %d after local eviction", metrics.KeyCount, n)
+	}
+	if int(metrics.Evictions)+metrics.KeyCount != n {
+		t.Fatalf("evictions %d + keys %d != %d", metrics.Evictions, metrics.KeyCount, n)
+	}
+	assertMemory(t, c)
+	assertKeyIndex(t, c)
+}
+
+func TestMaxMemoryUpdateEvictsLFUNeighbor(t *testing.T) {
+	keys := keysOnShard(t, 0, 2)
+	small := estimateSize(keys[0], "v")
+	budget := small * 2
+	c := newTestCache(t, Options{
+		MaxKeys:        evenCap(8),
+		MaxMemory:      budget * shardCount,
+		EvictionPolicy: EvictionLFU,
+	})
+	mustSet(t, c, keys[0], "v")
+	mustSet(t, c, keys[1], "v")
+	for i := 0; i < 3; i++ {
+		if _, err := c.Get(context.Background(), keys[0]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	need := int(budget - int64(len(keys[0])) - perEntryOverhead)
+	mustSet(t, c, keys[0], strings.Repeat("y", need))
+	assertMissing(t, c, keys[1])
+	assertHit(t, c, keys[0], strings.Repeat("y", need))
+	assertLFUBuckets(t, c)
+	assertMemory(t, c)
+}
+
+func TestParseEvictionPolicy(t *testing.T) {
+	cases := []string{"", "lru", "LFU", "allkeys-lru", "allkeys-lfu", "allkeys-random", "volatile-ttl", "noeviction"}
+	for _, name := range cases {
+		if _, err := ParseEvictionPolicy(name); err != nil {
+			t.Fatalf("parse %q: %v", name, err)
+		}
+	}
+	if _, err := ParseEvictionPolicy("volatile-lru"); err == nil {
+		t.Fatal("expected invalid policy")
+	}
+}
+
 func BenchmarkSet(b *testing.B) {
 	c := New(Options{MaxKeys: b.N + 1})
 	defer c.Close()
@@ -792,7 +1206,7 @@ func BenchmarkSet(b *testing.B) {
 }
 
 func BenchmarkGetHit(b *testing.B) {
-	c := New(Options{MaxKeys: 10})
+	c := New(Options{MaxKeys: 64})
 	defer c.Close()
 	_ = c.Set(context.Background(), "key", "value", 0)
 	b.ResetTimer()
@@ -802,7 +1216,7 @@ func BenchmarkGetHit(b *testing.B) {
 }
 
 func BenchmarkGetMiss(b *testing.B) {
-	c := New(Options{MaxKeys: 10})
+	c := New(Options{MaxKeys: 64})
 	defer c.Close()
 	for i := 0; i < b.N; i++ {
 		_, _ = c.Get(context.Background(), "missing")
@@ -957,6 +1371,59 @@ func assertMissing(t *testing.T, c *Cache, key string) {
 	}
 }
 
+func evenCap(perShard int) int {
+	return perShard * shardCount
+}
+
+func keysOnShard(t *testing.T, shard, n int) []string {
+	t.Helper()
+	keys := make([]string, 0, n)
+	for i := 0; len(keys) < n && i < 1_000_000; i++ {
+		key := fmt.Sprintf("s%d-%06d", shard, i)
+		if shardIndex(key) == shard {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) != n {
+		t.Fatalf("found %d keys on shard %d, want %d", len(keys), shard, n)
+	}
+	return keys
+}
+
+func mustSetTTL(t *testing.T, c *Cache, key, value string, ttl time.Duration) {
+	t.Helper()
+	if err := c.Set(context.Background(), key, value, ttl); err != nil {
+		t.Fatalf("set %s failed: %v", key, err)
+	}
+}
+
+func setClock(t *testing.T, c *Cache, key string, clock uint32) {
+	t.Helper()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.items[key]
+	if !ok {
+		t.Fatalf("missing %s", key)
+	}
+	item.lastAccessedAt = time.Unix(int64(clock), 0).UTC()
+}
+
+func setLFU(t *testing.T, c *Cache, key string, counter uint8, decayMin int64) {
+	t.Helper()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.items[key]
+	if !ok {
+		t.Fatalf("missing %s", key)
+	}
+	if s.lfuMeta == nil {
+		s.lfuMeta = map[*entry]lfuState{}
+	}
+	s.lfuMeta[item] = lfuState{log: counter, decay: decayMin}
+}
+
 func assertKeyCount(t *testing.T, c *Cache) {
 	t.Helper()
 	c.lockAll()
@@ -967,6 +1434,56 @@ func assertKeyCount(t *testing.T, c *Cache) {
 	}
 	if got := int(c.keyCount.Load()); got != n {
 		t.Fatalf("keyCount=%d shard lens=%d", got, n)
+	}
+}
+
+func assertKeyIndex(t *testing.T, c *Cache) {
+	t.Helper()
+	c.lockAll()
+	defer c.unlockAll()
+	for id := range c.shards {
+		s := &c.shards[id]
+		if !c.samplesKeys() {
+			if len(s.keys) != 0 || len(s.keyIndex) != 0 {
+				t.Fatalf("shard %d tracked a key sample for policy %s", id, c.evictionPolicy)
+			}
+			continue
+		}
+		if len(s.keys) != len(s.items) || len(s.keyIndex) != len(s.items) {
+			t.Fatalf("shard %d keys=%d index=%d items=%d", id, len(s.keys), len(s.keyIndex), len(s.items))
+		}
+		for i, item := range s.keys {
+			if item == nil || s.keyIndex[item] != i || s.items[item.key] != item {
+				t.Fatalf("shard %d index mismatch at %d", id, i)
+			}
+		}
+	}
+}
+
+func assertMemory(t *testing.T, c *Cache) {
+	t.Helper()
+	c.lockAll()
+	defer c.unlockAll()
+	var sum int64
+	for id := range c.shards {
+		s := &c.shards[id]
+		var bytes int64
+		for _, item := range s.items {
+			bytes += item.sizeBytes
+		}
+		if s.bytes != bytes {
+			t.Fatalf("shard %d bytes=%d sum=%d", id, s.bytes, bytes)
+		}
+		if s.maxMemory > 0 && s.bytes > s.maxMemory {
+			t.Fatalf("shard %d bytes=%d over %d", id, s.bytes, s.maxMemory)
+		}
+		if len(s.items) > s.maxKeys {
+			t.Fatalf("shard %d keys=%d over %d", id, len(s.items), s.maxKeys)
+		}
+		sum += s.bytes
+	}
+	if got := c.memoryBytes.Load(); got != sum {
+		t.Fatalf("memoryBytes=%d shard sum=%d", got, sum)
 	}
 }
 
