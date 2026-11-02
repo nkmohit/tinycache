@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"os"
 	"sort"
 	"strings"
@@ -26,6 +27,13 @@ var (
 const (
 	TTLNoExpiry = -1
 	TTLMissing  = -2
+
+	// Active expiry matches Redis: sample a handful of keys that actually
+	// have a TTL, and keep sampling while more than a quarter of them are
+	// already expired. The budget stops one cycle from running without bound.
+	expireSampleSize  = 20
+	expireStaleRatio  = 4 // repeat while removed/sampled > 1/expireStaleRatio (25%)
+	expireCycleBudget = 25 * time.Millisecond
 )
 
 type EvictionPolicy string
@@ -49,6 +57,12 @@ type Cache struct {
 
 	items map[string]*entry
 	lru   *list.List
+
+	// ttlKeys is the unordered set of keys that have an expiry. The slice
+	// makes a random sample O(1); ttlIndex maps a key to its slice slot so
+	// insert and delete are O(1) as well. Keys with no TTL are not stored.
+	ttlKeys  []string
+	ttlIndex map[string]int
 
 	maxKeys        int
 	evictionPolicy EvictionPolicy
@@ -154,6 +168,7 @@ func New(opts Options) *Cache {
 	c := &Cache{
 		items:          map[string]*entry{},
 		lru:            list.New(),
+		ttlIndex:       map[string]int{},
 		maxKeys:        maxKeys,
 		evictionPolicy: evictionPolicy,
 		recorder:       metrics.NewRecorder(opts.EventLogSize),
@@ -203,7 +218,6 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.removeExpiredLocked(now)
 	expiresAt := expiryFromTTL(now, ttl)
 	size := estimateSize(key, value)
 
@@ -215,6 +229,7 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 		item.lastAccessedAt = now
 		item.sizeBytes = size
 		c.lru.MoveToFront(item.lruElement)
+		c.trackTTLLocked(item)
 		c.appendLogLocked(ReplayRecord{
 			Command:    "set",
 			Key:        key,
@@ -245,6 +260,7 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 	item.lruElement = c.lru.PushFront(item)
 	c.items[key] = item
 	c.memoryBytes += size
+	c.trackTTLLocked(item)
 
 	c.evictUntilWithinLimitLocked()
 	c.appendLogLocked(ReplayRecord{
@@ -354,6 +370,7 @@ func (c *Cache) Expire(_ context.Context, key string, ttl time.Duration) (bool, 
 
 	item.expiresAt = expiryFromTTL(now, ttl)
 	item.updatedAt = now
+	c.trackTTLLocked(item)
 	c.appendLogLocked(ReplayRecord{
 		Command:    "expire",
 		Key:        key,
@@ -541,20 +558,94 @@ func (c *Cache) cleanupLoop(interval time.Duration) {
 	}
 }
 
+// cleanupExpired samples keys that have a TTL instead of scanning the keyspace.
+// Each sample runs under the lock, then the lock is dropped so a long cycle
+// cannot stall Get and Set. Sampling repeats while more than 25% of the
+// sample was expired, or until expireCycleBudget elapses.
 func (c *Cache) cleanupExpired() {
 	start := time.Now()
-	now := start.UTC()
+	deadline := start.Add(expireCycleBudget)
+	removedTotal := 0
+	for {
+		c.mu.Lock()
+		removed, sampled := c.expireSampleLocked(time.Now().UTC())
+		c.mu.Unlock()
+		removedTotal += removed
+		if sampled == 0 || removed*expireStaleRatio <= sampled {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+	}
 
-	c.mu.Lock()
-	removed := c.removeExpiredLocked(now)
-	c.mu.Unlock()
-
-	if removed > 0 {
+	if removedTotal > 0 {
 		c.recorder.Record("cleanup", time.Since(start), metrics.Event{
 			Type:   metrics.EventCleanup,
 			Reason: "expired",
 		})
 	}
+}
+
+func (c *Cache) expireSampleLocked(now time.Time) (removed, sampled int) {
+	n := len(c.ttlKeys)
+	if n == 0 {
+		return 0, 0
+	}
+	sampled = expireSampleSize
+	if sampled > n {
+		sampled = n
+	}
+
+	var victims [expireSampleSize]*entry
+	for i := 0; i < sampled; i++ {
+		j := i + rand.Intn(n-i)
+		if i != j {
+			c.swapTTLLocked(i, j)
+		}
+		item := c.items[c.ttlKeys[i]]
+		if item != nil && item.expired(now) {
+			victims[removed] = item
+			removed++
+		}
+	}
+	for i := 0; i < removed; i++ {
+		c.removeItemLocked(victims[i], "expired")
+	}
+	return removed, sampled
+}
+
+func (c *Cache) trackTTLLocked(item *entry) {
+	hasTTL := !item.expiresAt.IsZero()
+	_, tracked := c.ttlIndex[item.key]
+	if hasTTL == tracked {
+		return
+	}
+	if !hasTTL {
+		c.untrackTTLLocked(item.key)
+		return
+	}
+	c.ttlIndex[item.key] = len(c.ttlKeys)
+	c.ttlKeys = append(c.ttlKeys, item.key)
+}
+
+func (c *Cache) untrackTTLLocked(key string) {
+	idx, ok := c.ttlIndex[key]
+	if !ok {
+		return
+	}
+	last := len(c.ttlKeys) - 1
+	moved := c.ttlKeys[last]
+	c.ttlKeys[idx] = moved
+	c.ttlIndex[moved] = idx
+	c.ttlKeys = c.ttlKeys[:last]
+	delete(c.ttlIndex, key)
+}
+
+func (c *Cache) swapTTLLocked(i, j int) {
+	c.ttlKeys[i], c.ttlKeys[j] = c.ttlKeys[j], c.ttlKeys[i]
+	c.ttlIndex[c.ttlKeys[i]] = i
+	c.ttlIndex[c.ttlKeys[j]] = j
 }
 
 func (c *Cache) removeExpiredLocked(now time.Time) int {
@@ -598,6 +689,7 @@ func (c *Cache) evictionVictimLocked() *entry {
 }
 
 func (c *Cache) removeItemLocked(item *entry, reason string) {
+	c.untrackTTLLocked(item.key)
 	delete(c.items, item.key)
 	c.lru.Remove(item.lruElement)
 	c.memoryBytes -= item.sizeBytes
@@ -651,6 +743,7 @@ func (c *Cache) loadSnapshot(path string) error {
 		item.lruElement = c.lru.PushFront(item)
 		c.items[item.key] = item
 		c.memoryBytes += size
+		c.trackTTLLocked(item)
 	}
 	c.evictUntilWithinLimitLocked()
 	return nil

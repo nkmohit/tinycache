@@ -7,7 +7,7 @@ TinyCache is a Redis-inspired in-memory cache engine with HTTP commands and debu
 ## Features
 
 - HTTP cache commands: `SET`, `GET`, `DEL`, `EXPIRE`, `TTL`.
-- TTL cleanup with lazy expiration and a background sweeper.
+- TTL cleanup with lazy expiration on read and a Redis-style background sweeper.
 - LRU and LFU eviction modes.
 - Metrics with hit ratio, memory estimate, evictions, and latency percentiles.
 - Debug endpoints for keys, LRU order, events, replay records, and one-call UI hydration.
@@ -98,6 +98,21 @@ make screenshot
 ```
 
 The screenshot is written to `docs/assets/cachescope.png`.
+
+## Benchmarks
+
+`SET` used to call `removeExpiredLocked` and walk every key. On the VM in [docs/benchmarks.md](docs/benchmarks.md), `BenchmarkSet` was 129,590 ns/op and `BenchmarkGetHit` was 301 ns/op (about 431×).
+
+Reads still drop an expired key on touch. A background cycle samples up to 20 keys from the TTL set and repeats while more than 25% of the sample is expired. The same commands afterward:
+
+| | before | after |
+| --- | ---: | ---: |
+| `BenchmarkSet` | 129,590 ns/op (7,717 ops/s) | 906 ns/op (1,103,387 ops/s) |
+| `BenchmarkGetHit` | 301 ns/op | 298 ns/op |
+| bench CLI, LRU, 100k ops, 10k keys, 30% writes | 32,509 ops/s | 1,970,416 ops/s |
+| bench CLI, LFU, same workload | 13,434 ops/s | 27,895 ops/s |
+
+`SET` is 3.0× `GET` hit (906 ns/op vs 298 ns/op). Allocs, the LFU eviction note, machine spec, and why the sweeper samples instead of using a min-heap are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Test
 

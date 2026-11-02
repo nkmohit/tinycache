@@ -137,6 +137,166 @@ func TestBackgroundCleanup(t *testing.T) {
 	}
 }
 
+func TestExpiredKeysAreNeverReturned(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 20, CleanupInterval: time.Hour})
+	ctx := context.Background()
+	for _, key := range []string{"get", "ttl", "expire", "snapshot", "lru"} {
+		if err := c.Set(ctx, key, "secret-"+key, 20*time.Millisecond); err != nil {
+			t.Fatalf("set %s: %v", key, err)
+		}
+	}
+	if err := c.Set(ctx, "live", "ok", 0); err != nil {
+		t.Fatalf("set live: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	result, err := c.Get(ctx, "get")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if result.Hit || result.Value != "" {
+		t.Fatalf("get returned expired key: %#v", result)
+	}
+
+	ttl, err := c.TTL(ctx, "ttl")
+	if err != nil {
+		t.Fatalf("ttl: %v", err)
+	}
+	if ttl != TTLMissing {
+		t.Fatalf("ttl of expired key = %d, want %d", ttl, TTLMissing)
+	}
+
+	updated, err := c.Expire(ctx, "expire", time.Minute)
+	if err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if updated {
+		t.Fatal("expire updated an already expired key")
+	}
+
+	for _, debug := range c.SnapshotKeys(KeyQuery{}) {
+		if debug.Key != "live" {
+			t.Fatalf("snapshot returned expired key %s", debug.Key)
+		}
+	}
+	lru := c.LRUKeys()
+	if len(lru) != 1 || lru[0] != "live" {
+		t.Fatalf("lru = %#v, want [live]", lru)
+	}
+	result, err = c.Get(ctx, "live")
+	if err != nil || !result.Hit || result.Value != "ok" {
+		t.Fatalf("live key: %#v err=%v", result, err)
+	}
+	assertTTLIndex(t, c)
+}
+
+func TestSetDoesNotScanForExpiredKeys(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 10, CleanupInterval: time.Hour})
+	ctx := context.Background()
+	if err := c.Set(ctx, "old", "gone", 15*time.Millisecond); err != nil {
+		t.Fatalf("set old: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := c.Set(ctx, "new", "value", 0); err != nil {
+		t.Fatalf("set new: %v", err)
+	}
+	if got := c.Metrics().KeyCount; got != 2 {
+		t.Fatalf("set should leave the expired key in place, got %d keys", got)
+	}
+	result, err := c.Get(ctx, "old")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if result.Hit || result.Value != "" {
+		t.Fatalf("expired key returned: %#v", result)
+	}
+	if got := c.Metrics().KeyCount; got != 1 {
+		t.Fatalf("lazy get should drop the expired key, got %d keys", got)
+	}
+	assertTTLIndex(t, c)
+}
+
+func TestSweeperCycleDrainsExpiredKeys(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 500, CleanupInterval: time.Hour})
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if err := c.Set(ctx, fmt.Sprintf("dead-%d", i), "v", 20*time.Millisecond); err != nil {
+			t.Fatalf("set dead-%d: %v", i, err)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := c.Delete(ctx, fmt.Sprintf("dead-%d", i)); err != nil {
+			t.Fatalf("delete dead-%d: %v", i, err)
+		}
+	}
+	if err := c.Set(ctx, "keep", "v", 0); err != nil {
+		t.Fatalf("set keep: %v", err)
+	}
+	if updated, err := c.Expire(ctx, "keep", time.Hour); err != nil || !updated {
+		t.Fatalf("expire keep onto a ttl: updated=%v err=%v", updated, err)
+	}
+	if updated, err := c.Expire(ctx, "keep", 0); err != nil || !updated {
+		t.Fatalf("expire keep clear ttl: updated=%v err=%v", updated, err)
+	}
+	if err := c.Set(ctx, "later", "v", time.Hour); err != nil {
+		t.Fatalf("set later: %v", err)
+	}
+	assertTTLIndex(t, c)
+
+	time.Sleep(40 * time.Millisecond)
+	c.cleanupExpired()
+
+	if got := c.Metrics().KeyCount; got != 2 {
+		t.Fatalf("expected sweeper to leave keep and later, got %d keys", got)
+	}
+	for _, key := range []string{"keep", "later"} {
+		result, err := c.Get(ctx, key)
+		if err != nil || !result.Hit || result.Value != "v" {
+			t.Fatalf("%s: %#v err=%v", key, result, err)
+		}
+	}
+	result, err := c.Get(ctx, "dead-50")
+	if err != nil || result.Hit {
+		t.Fatalf("expired key returned: %#v err=%v", result, err)
+	}
+	assertTTLIndex(t, c)
+}
+
+func TestSweeperEventuallyReclaims(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 500, CleanupInterval: 5 * time.Millisecond})
+	ctx := context.Background()
+	for i := 0; i < 50; i++ {
+		if err := c.Set(ctx, fmt.Sprintf("dead-%d", i), "v", 20*time.Millisecond); err != nil {
+			t.Fatalf("set dead-%d: %v", i, err)
+		}
+	}
+	if err := c.Set(ctx, "keep", "v", 0); err != nil {
+		t.Fatalf("set keep: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.Metrics().KeyCount == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := c.Metrics().KeyCount; got != 1 {
+		t.Fatalf("background sweeper left %d keys", got)
+	}
+	result, err := c.Get(ctx, "keep")
+	if err != nil || !result.Hit || result.Value != "v" {
+		t.Fatalf("keep: %#v err=%v", result, err)
+	}
+	for i := 0; i < 50; i++ {
+		result, err := c.Get(ctx, fmt.Sprintf("dead-%d", i))
+		if err != nil || result.Hit {
+			t.Fatalf("dead-%d returned %#v err=%v", i, result, err)
+		}
+	}
+	assertTTLIndex(t, c)
+}
+
 func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	c := newTestCache(t, Options{MaxKeys: 2, EventLogSize: 10})
 
@@ -335,5 +495,30 @@ func mustSet(t *testing.T, c *Cache, key, value string) {
 	t.Helper()
 	if err := c.Set(context.Background(), key, value, 0); err != nil {
 		t.Fatalf("set %s failed: %v", key, err)
+	}
+}
+
+func assertTTLIndex(t *testing.T, c *Cache) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.ttlKeys) != len(c.ttlIndex) {
+		t.Fatalf("ttl set len keys=%d index=%d", len(c.ttlKeys), len(c.ttlIndex))
+	}
+	for i, key := range c.ttlKeys {
+		idx, ok := c.ttlIndex[key]
+		if !ok || idx != i {
+			t.Fatalf("ttl index mismatch for %s at %d: idx=%d ok=%v", key, i, idx, ok)
+		}
+		item, ok := c.items[key]
+		if !ok || item.expiresAt.IsZero() {
+			t.Fatalf("ttl key %s missing a live expiry", key)
+		}
+	}
+	for key, item := range c.items {
+		_, tracked := c.ttlIndex[key]
+		if item.expiresAt.IsZero() == tracked {
+			t.Fatalf("ttl tracking mismatch for %s tracked=%v expires=%s", key, tracked, item.expiresAt)
+		}
 	}
 }
