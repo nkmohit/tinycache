@@ -17,6 +17,7 @@ TinyCache is a Redis-inspired in-memory cache engine with HTTP commands and a de
 - Checksummed snapshots and an append-only log with `always`, `everysec`, or `no` fsync, rewrite, and crash recovery.
 - CacheScope static dashboard served by the Go server.
 - Demo seeder and benchmark CLI.
+- RESP2 server for `redis-cli` and `redis-benchmark`.
 
 ## Run
 
@@ -40,8 +41,37 @@ go run ./cmd/tinycache \
   --appendfsync everysec \
   --auto-aof-rewrite-percentage 100 \
   --auto-aof-rewrite-min-size 67108864 \
-  --ui-dir web/cachescope
+  --ui-dir web/cachescope \
+  --redis-addr :6379 \
+  --redis-idle-timeout 5m \
+  --redis-max-clients 10000
 ```
+
+## Redis
+
+TinyCache speaks the Redis RESP2 wire protocol on `--redis-addr` (default `:6379`). An empty `--redis-addr` leaves the Redis listener off. `SIGINT` and `SIGTERM` stop the HTTP server and the Redis server.
+
+```sh
+go run ./cmd/tinycache --addr :8080 --redis-addr :6379
+redis-cli -p 6379 PING
+redis-cli -p 6379 SET name tiny EX 60
+redis-cli -p 6379 GET name
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 100000 -P 16
+```
+
+Each connection runs on its own goroutine. Pipelined replies stay in the write buffer until the read buffer drains, then one flush sends them. Idle connections close after `--redis-idle-timeout` (default 5m; `0` disables the timeout). `--redis-max-clients` defaults to 10000; further connections receive `-ERR max number of clients reached` and are closed.
+
+Bulk strings are capped at 32 MiB and arrays at 1,048,576 elements. A length over the cap is rejected before that buffer is allocated. A malformed frame gets `-ERR` and that connection closes.
+
+Supported commands: `PING`, `ECHO`, `GET`, `SET` (`EX`, `PX`, `NX`, `XX`), `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `INCR`, `INCRBY`, `DECR`, `MGET`, `MSET`, `KEYS`, `DBSIZE`, `FLUSHALL`, `INFO`, `COMMAND`, `QUIT`. `CONFIG GET` answers `save` and `appendonly` so `redis-benchmark` can start. An unknown command returns a Redis-style `-ERR unknown command ...` reply. `INCR`, `INCRBY`, and `DECR` return `-ERR increment or decrement would overflow` on int64 overflow.
+
+Mutating commands go through the cache API, so when `--aof-path` is set they are appended to the same AOF as HTTP `SET`, `DEL`, and `EXPIRE`.
+
+`noeviction` answers a full shard with `-OOM command not allowed when used memory > 'maxmemory'`. A TTL that overflows the representable range is `-ERR invalid expire time`. A key over 64 KiB or a value over 256 KiB is `-ERR` plus the cache size-limit text. `INFO` memory includes `maxmemory` and `maxmemory_policy`.
+
+`KEYS`, `FLUSHALL`, and `PTTL` walk key metadata through the public snapshot API. `PTTL` needs that walk because `TTL` reports whole seconds.
+
+Numbers from `redis-benchmark -t set,get -n 100000 -P 16` are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Commands
 
@@ -108,6 +138,7 @@ make bench-cli
 make run
 make demo
 make smoke
+make redis-smoke
 ```
 
 Sample HTTP requests are available in `examples/tinycache.http`.

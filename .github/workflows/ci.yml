@@ -16,6 +16,10 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race ./...
+      - name: Install redis-tools
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - name: redis-cli smoke and redis-benchmark
+        run: bash scripts/redis-cli-smoke.sh
 
   lint:
     runs-on: ubuntu-latest
@@ -46,3 +50,4 @@ jobs:
           go test -run=^$ -fuzz=FuzzParseTTL -fuzztime=20s ./internal/cache
           go test -run=^$ -fuzz=FuzzDecodeAOF -fuzztime=20s ./internal/cache
           go test -run=^$ -fuzz=FuzzHTTPCommands -fuzztime=20s ./internal/httpapi
+          go test -run=^$ -fuzz=FuzzRESPParser -fuzztime=20s ./internal/resp

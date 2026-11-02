@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/nkmohit/tinycache/internal/cache"
 	"github.com/nkmohit/tinycache/internal/httpapi"
+	"github.com/nkmohit/tinycache/internal/resp"
 )
 
 func main() {
@@ -28,6 +30,9 @@ func main() {
 	autoRewritePct := flag.Int("auto-aof-rewrite-percentage", 100, "rewrite the AOF after it grows by this percent since the last rewrite; 0 disables")
 	autoRewriteMin := flag.Int64("auto-aof-rewrite-min-size", 64<<20, "minimum AOF size in bytes before an automatic rewrite")
 	uiDir := flag.String("ui-dir", "", "optional directory to serve CacheScope static UI")
+	redisAddr := flag.String("redis-addr", ":6379", "RESP listen address; empty disables the Redis server")
+	redisIdle := flag.Duration("redis-idle-timeout", 5*time.Minute, "close idle Redis connections after this duration; 0 disables")
+	redisMaxClients := flag.Int("redis-max-clients", 10000, "maximum simultaneous Redis connections")
 	flag.Parse()
 
 	if *maxKeys <= 0 {
@@ -79,20 +84,45 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	var redisServer *resp.Server
+	if *redisAddr != "" {
+		redisServer = resp.NewServer(c, resp.Options{
+			Addr:        *redisAddr,
+			IdleTimeout: *redisIdle,
+			MaxClients:  *redisMaxClients,
+			MaxMemory:   *maxMemory,
+		})
+	}
+
 	go func() {
 		log.Printf("tinycache listening on %s", *addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server failed: %v", err)
 		}
 	}()
+	if redisServer != nil {
+		go func() {
+			log.Printf("tinycache redis listening on %s", *redisAddr)
+			if err := redisServer.ListenAndServe(); err != nil && !errors.Is(err, resp.ErrClosed) {
+				log.Fatalf("redis server failed: %v", err)
+			}
+		}()
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("server shutdown failed: %v", err)
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer httpCancel()
+	if err := server.Shutdown(httpCtx); err != nil {
+		log.Printf("http shutdown failed: %v", err)
+	}
+	if redisServer != nil {
+		redisCtx, redisCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer redisCancel()
+		if err := redisServer.Shutdown(redisCtx); err != nil {
+			log.Printf("redis shutdown failed: %v", err)
+		}
 	}
 }
