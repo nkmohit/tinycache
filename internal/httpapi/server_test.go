@@ -184,7 +184,7 @@ func TestDebugInfo(t *testing.T) {
 	s := newTestServer(t)
 
 	status, body := request(t, s, http.MethodGet, "/debug/info", "")
-	if status != http.StatusOK || body["evictionPolicy"] != "lru" || body["maxKeys"].(float64) != 10 {
+	if status != http.StatusOK || body["evictionPolicy"] != "lru" || body["maxKeys"].(float64) != 64 {
 		t.Fatalf("unexpected info response status=%d body=%v", status, body)
 	}
 }

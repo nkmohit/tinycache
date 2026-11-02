@@ -674,9 +674,15 @@ type EngineInfo struct {
 }
 
 func (c *Cache) EngineInfo() EngineInfo {
+	// Each shard holds its own share of the key limit. Open writes those
+	// shares once, and they sum to the configured MaxKeys.
+	maxKeys := 0
+	for i := range c.shards {
+		maxKeys += c.shards[i].maxKeys
+	}
 	return EngineInfo{
 		EvictionPolicy: c.evictionPolicy,
-		MaxKeys:        c.maxKeys,
+		MaxKeys:        maxKeys,
 	}
 }
 
