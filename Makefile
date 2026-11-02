@@ -1,4 +1,4 @@
-.PHONY: build fmt test race lint fuzz bench bench-cli run demo screenshot smoke
+.PHONY: build fmt test race lint fuzz bench bench-cli run demo screenshot smoke redis-smoke
 
 # `make` builds the server. TMPDIR is set on macOS and often unset on Linux.
 .DEFAULT_GOAL := build
@@ -13,6 +13,9 @@ GOCACHE ?= $(TMPDIR)/tinycache-gocache
 BASE_URL ?= http://localhost:8080
 SNAPSHOT_PATH ?= $(TMPDIR)/tinycache.snapshot.json
 AOF_PATH ?= $(TMPDIR)/tinycache.aof
+REDIS_ADDR ?= :6379
+REDIS_IDLE_TIMEOUT ?= 5m
+REDIS_MAX_CLIENTS ?= 10000
 CACHESCOPE_SCREENSHOT ?= docs/assets/cachescope.png
 NODE_BIN ?= node
 
@@ -37,6 +40,7 @@ fuzz:
 	GOCACHE=$(GOCACHE) go test -run=^$$ -fuzz=FuzzParseTTL -fuzztime=20s ./internal/cache
 	GOCACHE=$(GOCACHE) go test -run=^$$ -fuzz=FuzzDecodeAOF -fuzztime=20s ./internal/cache
 	GOCACHE=$(GOCACHE) go test -run=^$$ -fuzz=FuzzHTTPCommands -fuzztime=20s ./internal/httpapi
+	GOCACHE=$(GOCACHE) go test -run=^$$ -fuzz=FuzzRESPParser -fuzztime=20s ./internal/resp
 
 bench:
 	GOCACHE=$(GOCACHE) go test -bench=. ./internal/cache
@@ -45,7 +49,10 @@ bench-cli:
 	GOCACHE=$(GOCACHE) go run ./cmd/tinycache-bench --ops 100000 --max-keys 10000 --eviction-policy lru
 
 run:
-	GOCACHE=$(GOCACHE) go run ./cmd/tinycache --addr $(ADDR) --max-keys $(MAX_KEYS) --cleanup-interval $(CLEANUP_INTERVAL) --event-log-size $(EVENT_LOG_SIZE) --snapshot-path $(SNAPSHOT_PATH) --aof-path $(AOF_PATH) --ui-dir $(UI_DIR)
+	GOCACHE=$(GOCACHE) go run ./cmd/tinycache --addr $(ADDR) --max-keys $(MAX_KEYS) --cleanup-interval $(CLEANUP_INTERVAL) --event-log-size $(EVENT_LOG_SIZE) --snapshot-path $(SNAPSHOT_PATH) --aof-path $(AOF_PATH) --ui-dir $(UI_DIR) --redis-addr=$(REDIS_ADDR) --redis-idle-timeout $(REDIS_IDLE_TIMEOUT) --redis-max-clients $(REDIS_MAX_CLIENTS)
+
+redis-smoke:
+	bash scripts/redis-cli-smoke.sh
 
 demo:
 	GOCACHE=$(GOCACHE) go run ./cmd/tinycache-demo --base-url $(BASE_URL)

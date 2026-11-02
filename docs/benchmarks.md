@@ -189,3 +189,47 @@ One admission lock on every new key. At the global cap, an eviction locks all 16
 The LRU bench CLI went from 1,651,650 ops/s to 1,788,250 ops/s, and LFU from 1,451,155 to 1,587,813. At 100,000 ops the CLI duration sits in a band of about 10 ms, and the medians still move with the eviction benchmarks.
 
 The cost of the split is skew. A shard can evict while another still has room, so a `MaxKeys` of `n+1` no longer guarantees that `n` inserts are eviction-free. Exact `lru` and `lfu` are unchanged as algorithms; they just run on the shard's own list or frequency buckets. `allkeys-lru` and `allkeys-lfu` instead sample 5 keys in that shard and drop the worst by LRU clock or logarithmic LFU counter.
+
+## RESP redis-benchmark
+
+Measured on the same cloud VM after the RESP2 server landed. The cache was empty of AOF and snapshot work: `--aof-path` was unset, so `CONFIG GET appendonly` answered `no`. `--redis-idle-timeout 0` kept the benchmark clients from being closed for idleness. `--max-keys 1000000`. `redis-benchmark` was left on its default of 50 clients and a single key (`-r` was not set).
+
+### Machine
+
+| | |
+| --- | --- |
+| CPU | Intel(R) Xeon(R) Processor (KVM, family 6, model 207) |
+| Cores | 4 (1 thread per core, 1 socket) |
+| Memory | 16 GB (MemTotal 16,387,280 kB) |
+| OS | Linux 6.12.94+ x86_64 |
+| Go | go1.22.2 linux/amd64 |
+| redis-benchmark | 7.0.15 |
+
+### Command
+
+```sh
+go run ./cmd/tinycache \
+  --addr 127.0.0.1:8080 \
+  --redis-addr 127.0.0.1:6379 \
+  --redis-idle-timeout 0 \
+  --max-keys 1000000
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 100000 -P 16
+```
+
+The port in the run below was 16380, same binary and flags. `scripts/redis-cli-smoke.sh` runs this benchmark in CI after a redis-cli smoke pass.
+
+### Result
+
+| Command | Requests | Time | Clients | Payload | Pipeline | req/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SET | 100000 | 0.36 s | 50 | 3 bytes | 16 | 277,008 |
+| GET | 100000 | 0.35 s | 50 | 3 bytes | 16 | 289,017 |
+
+Latency reported by redis-benchmark 7.0.15, in milliseconds:
+
+| Command | avg | min | p50 | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SET | 2.866 | 0.056 | 0.087 | 14.647 | 27.183 | 63.743 |
+| GET | 2.753 | 0.056 | 0.079 | 14.143 | 24.351 | 51.231 |
+
+The median is under 0.1 ms. The 75th percentile is 3.2 ms for both commands, and the average sits near 2.8 ms because the tail, with 50 clients and a pipeline of 16, reaches tens of milliseconds. Keepalive was on. The tool printed `host configuration "save":` empty and `host configuration "appendonly": no`.
