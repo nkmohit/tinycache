@@ -666,6 +666,20 @@ func (c *Cache) Metrics() metrics.Snapshot {
 	return c.recorder.Snapshot(int(c.keyCount.Load()), c.memoryBytes.Load())
 }
 
+// EngineInfo is the eviction configuration CacheScope shows beside live
+// metrics. Both fields are fixed for the life of the process.
+type EngineInfo struct {
+	EvictionPolicy EvictionPolicy `json:"evictionPolicy"`
+	MaxKeys        int            `json:"maxKeys"`
+}
+
+func (c *Cache) EngineInfo() EngineInfo {
+	return EngineInfo{
+		EvictionPolicy: c.evictionPolicy,
+		MaxKeys:        c.maxKeys,
+	}
+}
+
 func (c *Cache) Events() []metrics.Event {
 	return c.recorder.Events()
 }

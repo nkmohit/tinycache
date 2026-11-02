@@ -175,6 +175,18 @@ func TestStaticUIServing(t *testing.T) {
 	if !bytes.Contains(rec.Body.Bytes(), []byte("CacheScope")) {
 		t.Fatalf("expected CacheScope UI body, got %s", rec.Body.String())
 	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("Keyspace")) || !bytes.Contains(rec.Body.Bytes(), []byte("Throughput")) {
+		t.Fatalf("expected CacheScope sections, got %s", rec.Body.String())
+	}
+}
+
+func TestDebugInfo(t *testing.T) {
+	s := newTestServer(t)
+
+	status, body := request(t, s, http.MethodGet, "/debug/info", "")
+	if status != http.StatusOK || body["evictionPolicy"] != "lru" || body["maxKeys"].(float64) != 10 {
+		t.Fatalf("unexpected info response status=%d body=%v", status, body)
+	}
 }
 
 func TestDebugEventStream(t *testing.T) {

@@ -67,6 +67,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /command/expire", s.handleExpire)
 	s.mux.HandleFunc("GET /command/ttl", s.handleTTL)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	s.mux.HandleFunc("GET /debug/info", s.handleDebugInfo)
 	s.mux.HandleFunc("GET /debug/keys", s.handleDebugKeys)
 	s.mux.HandleFunc("GET /debug/summary", s.handleDebugSummary)
 	s.mux.HandleFunc("GET /debug/lru", s.handleDebugLRU)
@@ -151,6 +152,10 @@ func (s *Server) handleTTL(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.cache.Metrics())
+}
+
+func (s *Server) handleDebugInfo(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.cache.EngineInfo())
 }
 
 func (s *Server) handleDebugKeys(w http.ResponseWriter, r *http.Request) {
