@@ -1,4 +1,4 @@
-.PHONY: build fmt test race bench bench-cli run demo screenshot smoke
+.PHONY: build fmt test race lint fuzz bench bench-cli run demo screenshot smoke
 
 # `make` builds the server. TMPDIR is set on macOS and often unset on Linux.
 .DEFAULT_GOAL := build
@@ -27,6 +27,16 @@ test:
 
 race:
 	GOCACHE=$(GOCACHE) go test -race ./...
+
+lint:
+	GOCACHE=$(GOCACHE) go vet ./...
+	GOCACHE=$(GOCACHE) staticcheck ./...
+	GOCACHE=$(GOCACHE) golangci-lint run --timeout=5m ./...
+
+fuzz:
+	GOCACHE=$(GOCACHE) go test -run=^$$ -fuzz=FuzzParseTTL -fuzztime=20s ./internal/cache
+	GOCACHE=$(GOCACHE) go test -run=^$$ -fuzz=FuzzDecodeAOF -fuzztime=20s ./internal/cache
+	GOCACHE=$(GOCACHE) go test -run=^$$ -fuzz=FuzzHTTPCommands -fuzztime=20s ./internal/httpapi
 
 bench:
 	GOCACHE=$(GOCACHE) go test -bench=. ./internal/cache

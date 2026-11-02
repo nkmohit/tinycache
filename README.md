@@ -181,7 +181,7 @@ Startup loads the snapshot, then replays the append-only file. Expiry is an abso
 
 #### Fsync
 
-`--appendfsync` follows Redis `appendfsync`. A failed append is logged and returned to the caller. The memory update has already been applied when that error comes back.
+`--appendfsync` follows Redis `appendfsync`. A failed append is logged and returned to the caller, and the in-memory change is not published.
 
 | Policy | What returns | What a crash can lose |
 | --- | --- | --- |
@@ -213,4 +213,6 @@ A final AOF record with no trailing newline that is not valid JSON is cut off an
 go test ./...
 go test -race ./...
 go test -bench=. ./internal/cache
+make lint
+make fuzz
 ```

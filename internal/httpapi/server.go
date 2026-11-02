@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -22,14 +23,14 @@ type Options struct {
 }
 
 type setRequest struct {
-	Key        string `json:"key"`
-	Value      string `json:"value"`
-	TTLSeconds int64  `json:"ttlSeconds,omitempty"`
+	Key        string   `json:"key"`
+	Value      string   `json:"value"`
+	TTLSeconds ttlInput `json:"ttlSeconds,omitempty"`
 }
 
 type expireRequest struct {
-	Key        string `json:"key"`
-	TTLSeconds int64  `json:"ttlSeconds"`
+	Key        string   `json:"key"`
+	TTLSeconds ttlInput `json:"ttlSeconds"`
 }
 
 type snapshotRequest struct {
@@ -84,11 +85,7 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.TTLSeconds < 0 {
-		writeError(w, http.StatusBadRequest, "ttlSeconds cannot be negative")
-		return
-	}
-	if err := s.cache.Set(r.Context(), req.Key, req.Value, ttlDuration(req.TTLSeconds)); err != nil {
+	if err := s.cache.Set(r.Context(), req.Key, req.Value, req.TTLSeconds.d); err != nil {
 		writeCacheError(w, err)
 		return
 	}
@@ -131,11 +128,7 @@ func (s *Server) handleExpire(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.TTLSeconds < 0 {
-		writeError(w, http.StatusBadRequest, "ttlSeconds cannot be negative")
-		return
-	}
-	updated, err := s.cache.Expire(r.Context(), req.Key, ttlDuration(req.TTLSeconds))
+	updated, err := s.cache.Expire(r.Context(), req.Key, req.TTLSeconds.d)
 	if err != nil {
 		writeCacheError(w, err)
 		return
@@ -165,7 +158,12 @@ func (s *Server) handleDebugKeys(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": s.cache.SnapshotKeys(query)})
+	keys, err := s.cache.SnapshotKeys(query)
+	if err != nil {
+		writeCacheError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
 }
 
 func (s *Server) handleDebugSummary(w http.ResponseWriter, r *http.Request) {
@@ -173,7 +171,12 @@ func (s *Server) handleDebugSummary(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.cache.Summary(query))
+	summary, err := s.cache.Summary(query)
+	if err != nil {
+		writeCacheError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func (s *Server) handleDebugLRU(w http.ResponseWriter, _ *http.Request) {
@@ -187,6 +190,10 @@ func (s *Server) handleDebugEvents(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleDebugReplay(w http.ResponseWriter, _ *http.Request) {
 	records, err := s.cache.ReplayRecords()
 	if err != nil && !errors.Is(err, cache.ErrAppendLogPath) {
+		if errors.Is(err, cache.ErrAOFTooLarge) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "could not read replay log")
 		return
 	}
@@ -210,7 +217,11 @@ func (s *Server) handleAdminSnapshot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.cache.SaveSnapshot(req.Path); err != nil {
+	if req.Path != "" {
+		writeError(w, http.StatusBadRequest, "snapshot path cannot be overridden")
+		return
+	}
+	if err := s.cache.SaveSnapshot(""); err != nil {
 		if errors.Is(err, cache.ErrSnapshotPath) {
 			writeError(w, http.StatusBadRequest, "snapshot path is not configured")
 			return
@@ -236,7 +247,10 @@ func (s *Server) handleDebugEventStream(w http.ResponseWriter, r *http.Request) 
 	defer ticker.Stop()
 
 	for {
-		payload := s.cache.Summary(cache.KeyQuery{})
+		payload, err := s.cache.Summary(cache.KeyQuery{})
+		if err != nil {
+			return
+		}
 		data, err := json.Marshal(payload)
 		if err != nil {
 			return
@@ -259,19 +273,50 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	defer r.Body.Close()
+	if r.Body == nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, cache.MaxRequestBytes)
+	defer func() {
+		_ = r.Body.Close()
+	}()
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
+		writeDecodeError(w, err)
+		return false
+	}
+	var extra struct{}
+	if err := decoder.Decode(&extra); err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return false
 	}
 	return true
 }
 
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytes *http.MaxBytesError
+	switch {
+	case errors.As(err, &maxBytes):
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+	case errors.Is(err, cache.ErrInvalidTTL), errors.Is(err, cache.ErrMalformedTTL), errors.Is(err, cache.ErrTTLOverflow):
+		writeError(w, http.StatusBadRequest, err.Error())
+	default:
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	}
+}
+
 func writeCacheError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, cache.ErrEmptyKey), errors.Is(err, cache.ErrInvalidTTL):
+	case errors.Is(err, cache.ErrEmptyKey),
+		errors.Is(err, cache.ErrInvalidTTL),
+		errors.Is(err, cache.ErrMalformedTTL),
+		errors.Is(err, cache.ErrTTLOverflow),
+		errors.Is(err, cache.ErrKeyTooLarge),
+		errors.Is(err, cache.ErrValueTooLarge),
+		errors.Is(err, cache.ErrInvalidKeySort),
+		errors.Is(err, cache.ErrFilterTooLarge):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, cache.ErrOOM):
 		writeError(w, http.StatusInsufficientStorage, err.Error())
@@ -311,17 +356,22 @@ func keyQueryFromRequest(w http.ResponseWriter, r *http.Request) (cache.KeyQuery
 		}
 		limit = parsed
 	}
+	filter := values.Get("filter")
+	if len(filter) > cache.MaxKeyBytes {
+		writeError(w, http.StatusBadRequest, cache.ErrFilterTooLarge.Error())
+		return cache.KeyQuery{}, false
+	}
+	sortBy := values.Get("sort")
+	switch sortBy {
+	case "", "key", "ttl", "size", "access", "updated", "accessed":
+	default:
+		writeError(w, http.StatusBadRequest, cache.ErrInvalidKeySort.Error())
+		return cache.KeyQuery{}, false
+	}
 	return cache.KeyQuery{
-		Filter: values.Get("filter"),
-		Sort:   values.Get("sort"),
+		Filter: filter,
+		Sort:   sortBy,
 		Desc:   values.Get("desc") == "true" || values.Get("order") == "desc",
 		Limit:  limit,
 	}, true
-}
-
-func ttlDuration(seconds int64) time.Duration {
-	if seconds == 0 {
-		return 0
-	}
-	return time.Duration(seconds) * time.Second
 }

@@ -178,7 +178,11 @@ func TestExpiredKeysAreNeverReturned(t *testing.T) {
 		t.Fatal("expire updated an already expired key")
 	}
 
-	for _, debug := range c.SnapshotKeys(KeyQuery{}) {
+	keys, err := c.SnapshotKeys(KeyQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, debug := range keys {
 		if debug.Key != "live" {
 			t.Fatalf("snapshot returned expired key %s", debug.Key)
 		}
@@ -512,12 +516,15 @@ func TestSnapshotKeysFiltersSortsAndLimits(t *testing.T) {
 		t.Fatalf("get failed: %v", err)
 	}
 
-	keys := c.SnapshotKeys(KeyQuery{
+	keys, err := c.SnapshotKeys(KeyQuery{
 		Filter: "session",
 		Sort:   "access",
 		Desc:   true,
 		Limit:  1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(keys) != 1 || keys[0].Key != "session:1" {
 		t.Fatalf("unexpected queried keys: %#v", keys)
 	}
@@ -588,6 +595,10 @@ func TestAOFWriteErrorSurfaces(t *testing.T) {
 	err := c.Set(context.Background(), "name", "tiny", 0)
 	if err == nil || !strings.Contains(err.Error(), "disk full") {
 		t.Fatalf("expected aof write error, got %v", err)
+	}
+	result, getErr := c.Get(context.Background(), "name")
+	if getErr != nil || result.Hit {
+		t.Fatalf("failed append must not publish the write, result=%#v err=%v", result, getErr)
 	}
 }
 
@@ -727,11 +738,19 @@ func TestAOFReplayAfterRestart(t *testing.T) {
 	for _, record := range records {
 		switch record.Command {
 		case "set":
-			if err := replayed.Set(context.Background(), record.Key, record.Value, time.Duration(record.TTLSeconds)*time.Second); err != nil {
+			ttl, ttlErr := record.ttlDuration()
+			if ttlErr != nil {
+				t.Fatalf("replay ttl: %v", ttlErr)
+			}
+			if err := replayed.Set(context.Background(), record.Key, record.Value, ttl); err != nil {
 				t.Fatalf("replay set: %v", err)
 			}
 		case "expire":
-			if _, err := replayed.Expire(context.Background(), record.Key, time.Duration(record.TTLSeconds)*time.Second); err != nil {
+			ttl, ttlErr := record.ttlDuration()
+			if ttlErr != nil {
+				t.Fatalf("replay ttl: %v", ttlErr)
+			}
+			if _, err := replayed.Expire(context.Background(), record.Key, ttl); err != nil {
 				t.Fatalf("replay expire: %v", err)
 			}
 		case "del":
@@ -905,7 +924,7 @@ func TestAllKeysLFUCounterDecays(t *testing.T) {
 }
 
 func TestLFULogIncrementAndDecay(t *testing.T) {
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewSource(1)) //nolint:gosec // G404: deterministic LFU counter fixture
 	counter := uint8(0)
 	for counter <= lfuInitVal {
 		next := lfuLogIncr(counter, rng)
@@ -1253,7 +1272,7 @@ func BenchmarkGetHitParallel(b *testing.B) {
 	var seq atomic.Uint64
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		i := int(seq.Add(1) * 17)
+		i := seq.Add(1) * 17
 		for pb.Next() {
 			_, _ = c.Get(ctx, keys[i&255])
 			i++
@@ -1273,7 +1292,7 @@ func BenchmarkMixedParallel(b *testing.B) {
 	var seq atomic.Uint64
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		i := int(seq.Add(1) * 17)
+		i := seq.Add(1) * 17
 		for pb.Next() {
 			if i&7 == 0 {
 				_ = c.Set(ctx, keys[i&255], "value", 0)

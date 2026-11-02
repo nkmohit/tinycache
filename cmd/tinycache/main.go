@@ -30,6 +30,22 @@ func main() {
 	uiDir := flag.String("ui-dir", "", "optional directory to serve CacheScope static UI")
 	flag.Parse()
 
+	if *maxKeys <= 0 {
+		log.Fatal("max-keys must be positive")
+	}
+	if *maxMemory < 0 {
+		log.Fatal("maxmemory cannot be negative")
+	}
+	if *cleanupInterval <= 0 {
+		log.Fatal("cleanup-interval must be positive")
+	}
+	if *eventLogSize < 0 {
+		log.Fatal("event-log-size cannot be negative")
+	}
+	if *autoRewritePct < 0 || *autoRewriteMin < 0 {
+		log.Fatal("auto rewrite settings cannot be negative")
+	}
+
 	policy, err := cache.ParseEvictionPolicy(*evictionPolicy)
 	if err != nil {
 		log.Fatal(err)

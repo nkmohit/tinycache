@@ -352,7 +352,7 @@ func TestAOFTruncatedTailIsRepaired(t *testing.T) {
 	mustSet(t, c, "b", "2")
 	c.Close()
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func TestAOFCorruptRecordAbortsStartup(t *testing.T) {
 		path := filepath.Join(dir, "middle.aof")
 		body := append(append([]byte{}, line...), []byte("{not-json}\n")...)
 		body = append(body, line...)
-		if err := os.WriteFile(path, body, 0o644); err != nil {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		_, err := Open(Options{MaxKeys: 1000, AppendLogPath: path, AppendFsync: FsyncNo, CleanupInterval: time.Hour})
@@ -438,7 +438,7 @@ func TestAOFCorruptRecordAbortsStartup(t *testing.T) {
 	t.Run("last complete line", func(t *testing.T) {
 		path := filepath.Join(dir, "last.aof")
 		body := append(append([]byte{}, line...), []byte("{not-json}\n")...)
-		if err := os.WriteFile(path, body, 0o644); err != nil {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		_, err := Open(Options{MaxKeys: 1000, AppendLogPath: path, AppendFsync: FsyncNo, CleanupInterval: time.Hour})
@@ -554,7 +554,7 @@ func TestSnapshotRoundTripAndV1(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		loaded := newTestCache(t, Options{MaxKeys: 1000, SnapshotPath: path, CleanupInterval: time.Hour})
@@ -580,7 +580,7 @@ func TestSnapshotRoundTripAndV1(t *testing.T) {
     "accessCount": 3
   }]
 }`)
-		if err := os.WriteFile(path, body, 0o644); err != nil {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		loaded := newTestCache(t, Options{MaxKeys: 1000, SnapshotPath: path, CleanupInterval: time.Hour})
@@ -629,7 +629,7 @@ func TestCorruptSnapshotRejected(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := os.WriteFile(path, tc.file, 0o644); err != nil {
+			if err := os.WriteFile(path, tc.file, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			_, err := Open(Options{MaxKeys: 1000, SnapshotPath: path, CleanupInterval: time.Hour})
@@ -699,7 +699,7 @@ func writeAOF(t *testing.T, path string, records []ReplayRecord) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

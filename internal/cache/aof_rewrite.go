@@ -73,7 +73,7 @@ func (c *Cache) rewriteAOFNow() error {
 	}
 	rf := &rewriteFile{f: tmp, name: tmp.Name()}
 	defer rf.cleanup()
-	if err := tmp.Chmod(0o644); err != nil {
+	if err := tmp.Chmod(0o600); err != nil {
 		return err
 	}
 
@@ -200,7 +200,7 @@ func (c *Cache) publishRewrite(rf *rewriteFile, bw *bufio.Writer) (int64, error)
 	rf.published = true
 	dirErr := fsyncDir(filepath.Dir(c.appendLogPath))
 
-	file, err := os.OpenFile(c.appendLogPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(c.appendLogPath, os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		c.aof.err = err
 		old := c.aof.file
@@ -269,8 +269,11 @@ func (c *Cache) replayAOF() error {
 	if !fi.Mode().IsRegular() {
 		return nil
 	}
-	data, err := os.ReadFile(c.appendLogPath)
+	data, err := readCapped(c.appendLogPath, MaxLogBytes)
 	if err != nil {
+		if errors.Is(err, errInputTooLarge) {
+			return ErrAOFTooLarge
+		}
 		return err
 	}
 	records, end, truncated, err := parseAOF(data)
@@ -310,6 +313,24 @@ func (c *Cache) replayAOF() error {
 	return nil
 }
 
+var errInputTooLarge = errors.New("input exceeds size limit")
+
+func readCapped(path string, max int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, errInputTooLarge
+	}
+	return data, nil
+}
+
 func (a *appendLogger) appendRaw(p []byte) error {
 	if a == nil {
 		return ErrAppendLogPath
@@ -332,10 +353,13 @@ func (c *Cache) ReplayRecords() ([]ReplayRecord, error) {
 	if c.appendLogPath == "" {
 		return nil, ErrAppendLogPath
 	}
-	data, err := os.ReadFile(c.appendLogPath)
+	data, err := readCapped(c.appendLogPath, MaxLogBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return []ReplayRecord{}, nil
+		}
+		if errors.Is(err, errInputTooLarge) {
+			return nil, ErrAOFTooLarge
 		}
 		return nil, err
 	}
@@ -358,6 +382,9 @@ func parseAOF(data []byte) (records []ReplayRecord, validEnd int, truncated bool
 		rel := bytes.IndexByte(data[i:], '\n')
 		if rel < 0 {
 			tail := data[i:]
+			if len(tail) > MaxAOFLineBytes {
+				return nil, 0, false, fmt.Errorf("%w: line exceeds size limit", ErrAOFTooLarge)
+			}
 			if len(bytes.TrimSpace(tail)) == 0 {
 				if len(tail) == 0 {
 					return records, i, false, nil
@@ -375,6 +402,9 @@ func parseAOF(data []byte) (records []ReplayRecord, validEnd int, truncated bool
 			return records, len(data), false, nil
 		}
 		line := data[i : i+rel]
+		if len(line) > MaxAOFLineBytes {
+			return nil, 0, false, fmt.Errorf("%w: line exceeds size limit", ErrAOFTooLarge)
+		}
 		next := i + rel + 1
 		if len(bytes.TrimSpace(line)) == 0 {
 			i = next
@@ -401,21 +431,19 @@ func (c *Cache) applyReplayLocked(rec ReplayRecord) error {
 		if rec.Key == "" {
 			return fmt.Errorf("%w: set without key", ErrCorruptAOF)
 		}
-		c.applySetLocked(rec)
-		return nil
+		return c.applySetLocked(rec)
 	case "expire":
 		if rec.Key == "" {
 			return fmt.Errorf("%w: expire without key", ErrCorruptAOF)
 		}
-		c.applyExpireLocked(rec)
-		return nil
+		return c.applyExpireLocked(rec)
 	case "del":
 		if rec.Key == "" {
 			return fmt.Errorf("%w: del without key", ErrCorruptAOF)
 		}
 		s := c.shard(rec.Key)
 		if item, ok := s.items[rec.Key]; ok {
-			c.removeItem(s, item, "")
+			_ = c.removeItem(s, item, "")
 		}
 		return nil
 	default:
@@ -423,17 +451,26 @@ func (c *Cache) applyReplayLocked(rec ReplayRecord) error {
 	}
 }
 
-func (c *Cache) applySetLocked(rec ReplayRecord) {
+func (c *Cache) applySetLocked(rec ReplayRecord) error {
+	if err := validateKey(rec.Key); err != nil {
+		return err
+	}
+	if err := validateValue(rec.Value); err != nil {
+		return err
+	}
 	at := rec.At
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	exp := recordExpiry(rec)
+	exp, err := recordExpiry(rec)
+	if err != nil {
+		return err
+	}
 	size := estimateSize(rec.Key, rec.Value)
 	s := c.shard(rec.Key)
 	if item, ok := s.items[rec.Key]; ok {
 		c.updateItem(s, item, rec.Value, exp, size, at)
-		return
+		return nil
 	}
 	c.insertItem(s, &entry{
 		key:            rec.Key,
@@ -444,31 +481,60 @@ func (c *Cache) applySetLocked(rec ReplayRecord) {
 		lastAccessedAt: at,
 		sizeBytes:      size,
 	})
+	return nil
 }
 
-func (c *Cache) applyExpireLocked(rec ReplayRecord) {
+func (c *Cache) applyExpireLocked(rec ReplayRecord) error {
+	if err := validateKey(rec.Key); err != nil {
+		return err
+	}
 	s := c.shard(rec.Key)
 	item, ok := s.items[rec.Key]
 	if !ok {
-		return
+		return nil
 	}
 	at := rec.At
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	item.expiresAt = recordExpiry(rec)
+	exp, err := recordExpiry(rec)
+	if err != nil {
+		return err
+	}
+	item.expiresAt = exp
 	item.updatedAt = at
 	s.trackTTL(item)
+	return nil
 }
 
-func recordExpiry(rec ReplayRecord) time.Time {
+// recordExpiry resolves a log line. ExpiresAt wins so a version-2 record keeps
+// its absolute time, including one that is already in the past. A line with
+// only ttlNanos or ttlSeconds (older files) is added to At, and a product
+// that does not fit in time.Duration is rejected instead of wrapping.
+func recordExpiry(rec ReplayRecord) (time.Time, error) {
 	if !rec.ExpiresAt.IsZero() {
-		return rec.ExpiresAt
+		return rec.ExpiresAt, nil
 	}
-	if rec.TTLSeconds > 0 && !rec.At.IsZero() {
-		return rec.At.Add(time.Duration(rec.TTLSeconds) * time.Second)
+	if rec.TTLNanos < 0 || rec.TTLSeconds < 0 {
+		return time.Time{}, ErrInvalidTTL
 	}
-	return time.Time{}
+	var ttl time.Duration
+	switch {
+	case rec.TTLNanos > 0:
+		ttl = time.Duration(rec.TTLNanos)
+	case rec.TTLSeconds > 0:
+		d, err := DurationFromSeconds(rec.TTLSeconds)
+		if err != nil {
+			return time.Time{}, err
+		}
+		ttl = d
+	default:
+		return time.Time{}, nil
+	}
+	if rec.At.IsZero() {
+		return time.Time{}, fmt.Errorf("%w: ttl without timestamp", ErrCorruptAOF)
+	}
+	return expiryFromTTL(rec.At, ttl)
 }
 
 func (c *Cache) resetLocked() {
