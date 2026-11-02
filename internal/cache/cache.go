@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"math/rand"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nkmohit/tinycache/internal/metrics"
@@ -34,6 +36,12 @@ const (
 	expireSampleSize  = 20
 	expireStaleRatio  = 4 // repeat while removed/sampled > 1/expireStaleRatio (25%)
 	expireCycleBudget = 25 * time.Millisecond
+
+	// shardCount is the number of independent key locks. A power of two lets
+	// the key hash pick a shard with a mask. GETs of different keys take
+	// different locks; a GET still updates recency, so it takes that shard's
+	// write lock rather than a read lock.
+	shardCount = 16
 )
 
 type EvictionPolicy string
@@ -50,11 +58,33 @@ type Options struct {
 	EvictionPolicy  EvictionPolicy
 	SnapshotPath    string
 	AppendLogPath   string
+	// AppendFsync is always, everysec, or no. Empty means everysec.
+	AppendFsync FsyncPolicy
 }
 
 type Cache struct {
-	mu sync.RWMutex
+	shards  [shardCount]shard
+	evictMu sync.Mutex // admission only; GETs do not take this
 
+	maxKeys        int
+	evictionPolicy EvictionPolicy
+	memoryBytes    atomic.Int64
+	keyCount       atomic.Int64
+	recorder       *metrics.Recorder
+
+	snapshotPath  string
+	appendLogPath string
+	aof           *appendLogger
+	aofDone       chan struct{}
+
+	stopCleanup chan struct{}
+	closeOnce   sync.Once
+}
+
+// shard owns the keys whose hash lands here, plus that subset's LRU list,
+// TTL sample set, and LFU frequency buckets.
+type shard struct {
+	mu    sync.Mutex
 	items map[string]*entry
 	lru   *list.List
 
@@ -64,17 +94,11 @@ type Cache struct {
 	ttlKeys  []string
 	ttlIndex map[string]int
 
-	maxKeys        int
-	evictionPolicy EvictionPolicy
-	memoryBytes    int64
-	recorder       *metrics.Recorder
-
-	snapshotPath  string
-	appendLogPath string
-	appendLog     *os.File
-
-	stopCleanup chan struct{}
-	closeOnce   sync.Once
+	// freqBuckets is one doubly linked list per access count. The list head
+	// was touched most recently. minFreq is the smallest count that still
+	// has a key, so eviction pops the tail of that list in O(1).
+	freqBuckets map[int64]*list.List
+	minFreq     int64
 }
 
 type entry struct {
@@ -87,6 +111,7 @@ type entry struct {
 	accessCount    int64
 	sizeBytes      int64
 	lruElement     *list.Element
+	lfuElement     *list.Element
 }
 
 type GetResult struct {
@@ -164,25 +189,36 @@ func New(opts Options) *Cache {
 	if evictionPolicy != EvictionLRU && evictionPolicy != EvictionLFU {
 		evictionPolicy = EvictionLRU
 	}
+	fsyncPolicy, err := ParseFsyncPolicy(string(opts.AppendFsync))
+	if err != nil {
+		log.Printf("tinycache aof: %v", err)
+		fsyncPolicy = FsyncEverySec
+	}
 
 	c := &Cache{
-		items:          map[string]*entry{},
-		lru:            list.New(),
-		ttlIndex:       map[string]int{},
 		maxKeys:        maxKeys,
 		evictionPolicy: evictionPolicy,
 		recorder:       metrics.NewRecorder(opts.EventLogSize),
 		snapshotPath:   opts.SnapshotPath,
 		appendLogPath:  opts.AppendLogPath,
+		aof:            openAppendLogger(opts.AppendLogPath, fsyncPolicy),
 		stopCleanup:    make(chan struct{}),
+	}
+	for i := range c.shards {
+		c.shards[i].items = map[string]*entry{}
+		c.shards[i].lru = list.New()
+		c.shards[i].ttlIndex = map[string]int{}
+		c.shards[i].freqBuckets = map[int64]*list.List{}
 	}
 	if opts.SnapshotPath != "" {
 		_ = c.loadSnapshot(opts.SnapshotPath)
 	}
-	if opts.AppendLogPath != "" {
-		if file, err := os.OpenFile(opts.AppendLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-			c.appendLog = file
-		}
+	if c.aof.runsBackgroundSync() {
+		c.aofDone = make(chan struct{})
+		go func() {
+			defer close(c.aofDone)
+			c.aof.everySecLoop(c.stopCleanup)
+		}()
 	}
 	go c.cleanupLoop(cleanupInterval)
 	return c
@@ -191,8 +227,11 @@ func New(opts Options) *Cache {
 func (c *Cache) Close() {
 	c.closeOnce.Do(func() {
 		close(c.stopCleanup)
-		if c.appendLog != nil {
-			_ = c.appendLog.Close()
+		if c.aofDone != nil {
+			<-c.aofDone
+		}
+		if err := c.aof.close(); err != nil {
+			log.Printf("tinycache aof: close: %v", err)
 		}
 	})
 }
@@ -215,38 +254,25 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 	}
 
 	now := time.Now().UTC()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	expiresAt := expiryFromTTL(now, ttl)
 	size := estimateSize(key, value)
-
-	if item, ok := c.items[key]; ok {
-		c.memoryBytes += size - item.sizeBytes
-		item.value = value
-		item.expiresAt = expiresAt
-		item.updatedAt = now
-		item.lastAccessedAt = now
-		item.sizeBytes = size
-		c.lru.MoveToFront(item.lruElement)
-		c.trackTTLLocked(item)
-		c.appendLogLocked(ReplayRecord{
-			Command:    "set",
-			Key:        key,
-			Value:      value,
-			TTLSeconds: int64(ttl.Seconds()),
-			At:         now,
-		})
-		return nil
+	record := ReplayRecord{
+		Command:    "set",
+		Key:        key,
+		Value:      value,
+		TTLSeconds: int64(ttl.Seconds()),
+		At:         now,
 	}
 
-	for len(c.items) >= c.maxKeys {
-		victim := c.evictionVictimLocked()
-		if victim == nil {
-			break
-		}
-		c.removeItemLocked(victim, "max_keys")
+	s := c.shard(key)
+	s.mu.Lock()
+	if item, ok := s.items[key]; ok {
+		c.updateItem(s, item, value, expiresAt, size, now)
+		err := c.aof.write(record)
+		s.mu.Unlock()
+		return err
 	}
+	s.mu.Unlock()
 
 	item := &entry{
 		key:            key,
@@ -257,20 +283,7 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 		lastAccessedAt: now,
 		sizeBytes:      size,
 	}
-	item.lruElement = c.lru.PushFront(item)
-	c.items[key] = item
-	c.memoryBytes += size
-	c.trackTTLLocked(item)
-
-	c.evictUntilWithinLimitLocked()
-	c.appendLogLocked(ReplayRecord{
-		Command:    "set",
-		Key:        key,
-		Value:      value,
-		TTLSeconds: int64(ttl.Seconds()),
-		At:         now,
-	})
-	return nil
+	return c.insertNew(s, item, record)
 }
 
 func (c *Cache) Get(_ context.Context, key string) (GetResult, error) {
@@ -290,21 +303,26 @@ func (c *Cache) Get(_ context.Context, key string) (GetResult, error) {
 	}
 
 	now := time.Now().UTC()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	item, ok := c.items[key]
+	item, ok := s.items[key]
 	if !ok {
 		return result, nil
 	}
 	if item.expired(now) {
-		c.removeItemLocked(item, "expired")
+		c.removeItem(s, item, "expired")
 		return result, nil
 	}
 
 	item.lastAccessedAt = now
-	item.accessCount++
-	c.lru.MoveToFront(item.lruElement)
+	s.lru.MoveToFront(item.lruElement)
+	if c.evictionPolicy == EvictionLFU {
+		s.promoteLFU(item)
+	} else {
+		item.accessCount++
+	}
 	result.Value = item.value
 	result.Hit = true
 	return result, nil
@@ -323,19 +341,22 @@ func (c *Cache) Delete(_ context.Context, key string) (bool, error) {
 		return false, ErrEmptyKey
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	item, ok := c.items[key]
+	item, ok := s.items[key]
 	if !ok {
 		return false, nil
 	}
-	c.removeItemLocked(item, "")
-	c.appendLogLocked(ReplayRecord{
+	c.removeItem(s, item, "")
+	if err := c.aof.write(ReplayRecord{
 		Command: "del",
 		Key:     key,
 		At:      time.Now().UTC(),
-	})
+	}); err != nil {
+		return true, err
+	}
 	return true, nil
 }
 
@@ -356,27 +377,30 @@ func (c *Cache) Expire(_ context.Context, key string, ttl time.Duration) (bool, 
 	}
 
 	now := time.Now().UTC()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	item, ok := c.items[key]
+	item, ok := s.items[key]
 	if !ok {
 		return false, nil
 	}
 	if item.expired(now) {
-		c.removeItemLocked(item, "expired")
+		c.removeItem(s, item, "expired")
 		return false, nil
 	}
 
 	item.expiresAt = expiryFromTTL(now, ttl)
 	item.updatedAt = now
-	c.trackTTLLocked(item)
-	c.appendLogLocked(ReplayRecord{
+	s.trackTTL(item)
+	if err := c.aof.write(ReplayRecord{
 		Command:    "expire",
 		Key:        key,
 		TTLSeconds: int64(ttl.Seconds()),
 		At:         now,
-	})
+	}); err != nil {
+		return true, err
+	}
 	return true, nil
 }
 
@@ -394,15 +418,16 @@ func (c *Cache) TTL(_ context.Context, key string) (int64, error) {
 	}
 
 	now := time.Now().UTC()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	item, ok := c.items[key]
+	item, ok := s.items[key]
 	if !ok {
 		return TTLMissing, nil
 	}
 	if item.expired(now) {
-		c.removeItemLocked(item, "expired")
+		c.removeItem(s, item, "expired")
 		return TTLMissing, nil
 	}
 	if item.expiresAt.IsZero() {
@@ -425,16 +450,18 @@ func (c *Cache) SnapshotDebug() DebugSnapshot {
 
 func (c *Cache) SnapshotKeys(query KeyQuery) []KeyDebug {
 	now := time.Now().UTC()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockAll()
+	defer c.unlockAll()
 
-	c.removeExpiredLocked(now)
-
-	keys := make([]KeyDebug, 0, len(c.items))
-	for _, item := range c.items {
-		debug := keyDebugFromEntry(item, now)
-		if query.Filter == "" || strings.Contains(strings.ToLower(debug.Key), strings.ToLower(query.Filter)) {
-			keys = append(keys, debug)
+	keys := make([]KeyDebug, 0)
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.removeExpired(now, c)
+		for _, item := range s.items {
+			debug := keyDebugFromEntry(item, now)
+			if query.Filter == "" || strings.Contains(strings.ToLower(debug.Key), strings.ToLower(query.Filter)) {
+				keys = append(keys, debug)
+			}
 		}
 	}
 	sortKeys(keys, query)
@@ -446,25 +473,38 @@ func (c *Cache) SnapshotKeys(query KeyQuery) []KeyDebug {
 
 func (c *Cache) LRUKeys() []string {
 	now := time.Now().UTC()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockAll()
 
-	c.removeExpiredLocked(now)
+	type stamped struct {
+		key string
+		at  time.Time
+	}
+	stampedKeys := make([]stamped, 0)
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.removeExpired(now, c)
+		for el := s.lru.Front(); el != nil; el = el.Next() {
+			item := el.Value.(*entry)
+			stampedKeys = append(stampedKeys, stamped{key: item.key, at: item.lastAccessedAt})
+		}
+	}
+	c.unlockAll()
 
-	keys := make([]string, 0, c.lru.Len())
-	for el := c.lru.Front(); el != nil; el = el.Next() {
-		keys = append(keys, el.Value.(*entry).key)
+	sort.Slice(stampedKeys, func(i, j int) bool {
+		if stampedKeys[i].at.Equal(stampedKeys[j].at) {
+			return stampedKeys[i].key < stampedKeys[j].key
+		}
+		return stampedKeys[i].at.After(stampedKeys[j].at)
+	})
+	keys := make([]string, len(stampedKeys))
+	for i, item := range stampedKeys {
+		keys[i] = item.key
 	}
 	return keys
 }
 
 func (c *Cache) Metrics() metrics.Snapshot {
-	c.mu.RLock()
-	keyCount := len(c.items)
-	memoryBytes := c.memoryBytes
-	c.mu.RUnlock()
-
-	return c.recorder.Snapshot(keyCount, memoryBytes)
+	return c.recorder.Snapshot(int(c.keyCount.Load()), c.memoryBytes.Load())
 }
 
 func (c *Cache) Events() []metrics.Event {
@@ -490,28 +530,30 @@ func (c *Cache) SaveSnapshot(path string) error {
 	}
 
 	now := time.Now().UTC()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.lockAll()
+	entries := make([]snapshotEntry, 0)
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.removeExpired(now, c)
+		for _, item := range s.items {
+			entries = append(entries, snapshotEntry{
+				Key:            item.key,
+				Value:          item.value,
+				ExpiresAt:      item.expiresAt,
+				CreatedAt:      item.createdAt,
+				UpdatedAt:      item.updatedAt,
+				LastAccessedAt: item.lastAccessedAt,
+				AccessCount:    item.accessCount,
+			})
+		}
+	}
+	c.unlockAll()
 
-	c.removeExpiredLocked(now)
-	file := snapshotFile{
+	data, err := json.MarshalIndent(snapshotFile{
 		Version: 1,
 		SavedAt: now,
-		Entries: make([]snapshotEntry, 0, len(c.items)),
-	}
-	for _, item := range c.items {
-		file.Entries = append(file.Entries, snapshotEntry{
-			Key:            item.key,
-			Value:          item.value,
-			ExpiresAt:      item.expiresAt,
-			CreatedAt:      item.createdAt,
-			UpdatedAt:      item.updatedAt,
-			LastAccessedAt: item.lastAccessedAt,
-			AccessCount:    item.accessCount,
-		})
-	}
-
-	data, err := json.MarshalIndent(file, "", "  ")
+		Entries: entries,
+	}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -559,22 +601,26 @@ func (c *Cache) cleanupLoop(interval time.Duration) {
 }
 
 // cleanupExpired samples keys that have a TTL instead of scanning the keyspace.
-// Each sample runs under the lock, then the lock is dropped so a long cycle
-// cannot stall Get and Set. Sampling repeats while more than 25% of the
-// sample was expired, or until expireCycleBudget elapses.
+// Each shard is sampled under its own lock, then the lock is dropped so a long
+// cycle cannot stall Get and Set. Sampling repeats while more than 25% of a
+// shard's sample was expired, or until expireCycleBudget elapses.
 func (c *Cache) cleanupExpired() {
 	start := time.Now()
 	deadline := start.Add(expireCycleBudget)
 	removedTotal := 0
 	for {
-		c.mu.Lock()
-		removed, sampled := c.expireSampleLocked(time.Now().UTC())
-		c.mu.Unlock()
-		removedTotal += removed
-		if sampled == 0 || removed*expireStaleRatio <= sampled {
-			break
+		stale := false
+		for i := range c.shards {
+			s := &c.shards[i]
+			s.mu.Lock()
+			removed, sampled := s.expireSample(time.Now().UTC(), c)
+			s.mu.Unlock()
+			removedTotal += removed
+			if sampled > 0 && removed*expireStaleRatio > sampled {
+				stale = true
+			}
 		}
-		if !time.Now().Before(deadline) {
+		if !stale || !time.Now().Before(deadline) {
 			break
 		}
 	}
@@ -587,8 +633,126 @@ func (c *Cache) cleanupExpired() {
 	}
 }
 
-func (c *Cache) expireSampleLocked(now time.Time) (removed, sampled int) {
-	n := len(c.ttlKeys)
+func (c *Cache) shard(key string) *shard {
+	return &c.shards[shardIndex(key)]
+}
+
+func shardIndex(key string) int {
+	// FNV-1a, 32-bit. Inlined so a GET does not allocate a hasher.
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return int(h & (shardCount - 1))
+}
+
+func (c *Cache) lockAll() {
+	for i := range c.shards {
+		c.shards[i].mu.Lock()
+	}
+}
+
+func (c *Cache) unlockAll() {
+	for i := len(c.shards) - 1; i >= 0; i-- {
+		c.shards[i].mu.Unlock()
+	}
+}
+
+// insertNew adds a key that was absent on the caller's first look. evictMu
+// serializes admissions so the global max is not exceeded. The per-shard lock
+// is enough while there is room; picking a global victim locks every shard in
+// index order so two evictions cannot deadlock.
+func (c *Cache) insertNew(s *shard, item *entry, record ReplayRecord) error {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	s.mu.Lock()
+	if existing, ok := s.items[item.key]; ok {
+		c.updateItem(s, existing, item.value, item.expiresAt, item.sizeBytes, item.updatedAt)
+		err := c.aof.write(record)
+		s.mu.Unlock()
+		return err
+	}
+	if c.keyCount.Load() < int64(c.maxKeys) {
+		c.insertItem(s, item)
+		err := c.aof.write(record)
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+
+	c.lockAll()
+	defer c.unlockAll()
+	if existing, ok := s.items[item.key]; ok {
+		c.updateItem(s, existing, item.value, item.expiresAt, item.sizeBytes, item.updatedAt)
+		return c.aof.write(record)
+	}
+	c.makeRoom()
+	c.insertItem(s, item)
+	for c.keyCount.Load() > int64(c.maxKeys) {
+		victimShard, victim := c.evictionVictim()
+		if victim == nil {
+			break
+		}
+		c.removeItem(victimShard, victim, "max_keys")
+	}
+	return c.aof.write(record)
+}
+
+func (c *Cache) makeRoom() {
+	for c.keyCount.Load() >= int64(c.maxKeys) {
+		victimShard, victim := c.evictionVictim()
+		if victim == nil {
+			return
+		}
+		c.removeItem(victimShard, victim, "max_keys")
+	}
+}
+
+func (c *Cache) updateItem(s *shard, item *entry, value string, expiresAt time.Time, size int64, now time.Time) {
+	c.addMemory(size - item.sizeBytes)
+	item.value = value
+	item.expiresAt = expiresAt
+	item.updatedAt = now
+	item.lastAccessedAt = now
+	item.sizeBytes = size
+	s.lru.MoveToFront(item.lruElement)
+	s.trackTTL(item)
+	if c.evictionPolicy == EvictionLFU {
+		s.touchLFU(item)
+	}
+}
+
+func (c *Cache) insertItem(s *shard, item *entry) {
+	item.lruElement = s.lru.PushFront(item)
+	s.items[item.key] = item
+	c.addMemory(item.sizeBytes)
+	c.keyCount.Add(1)
+	s.trackTTL(item)
+	if c.evictionPolicy == EvictionLFU {
+		s.linkLFU(item)
+	}
+}
+
+func (c *Cache) addMemory(delta int64) {
+	if delta == 0 {
+		return
+	}
+	for {
+		cur := c.memoryBytes.Load()
+		next := cur + delta
+		if next < 0 {
+			next = 0
+		}
+		if c.memoryBytes.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
+func (s *shard) expireSample(now time.Time, c *Cache) (removed, sampled int) {
+	n := len(s.ttlKeys)
 	if n == 0 {
 		return 0, 0
 	}
@@ -601,115 +765,187 @@ func (c *Cache) expireSampleLocked(now time.Time) (removed, sampled int) {
 	for i := 0; i < sampled; i++ {
 		j := i + rand.Intn(n-i)
 		if i != j {
-			c.swapTTLLocked(i, j)
+			s.swapTTL(i, j)
 		}
-		item := c.items[c.ttlKeys[i]]
+		item := s.items[s.ttlKeys[i]]
 		if item != nil && item.expired(now) {
 			victims[removed] = item
 			removed++
 		}
 	}
 	for i := 0; i < removed; i++ {
-		c.removeItemLocked(victims[i], "expired")
+		c.removeItem(s, victims[i], "expired")
 	}
 	return removed, sampled
 }
 
-func (c *Cache) trackTTLLocked(item *entry) {
+func (s *shard) trackTTL(item *entry) {
 	hasTTL := !item.expiresAt.IsZero()
-	_, tracked := c.ttlIndex[item.key]
+	_, tracked := s.ttlIndex[item.key]
 	if hasTTL == tracked {
 		return
 	}
 	if !hasTTL {
-		c.untrackTTLLocked(item.key)
+		s.untrackTTL(item.key)
 		return
 	}
-	c.ttlIndex[item.key] = len(c.ttlKeys)
-	c.ttlKeys = append(c.ttlKeys, item.key)
+	s.ttlIndex[item.key] = len(s.ttlKeys)
+	s.ttlKeys = append(s.ttlKeys, item.key)
 }
 
-func (c *Cache) untrackTTLLocked(key string) {
-	idx, ok := c.ttlIndex[key]
+func (s *shard) untrackTTL(key string) {
+	idx, ok := s.ttlIndex[key]
 	if !ok {
 		return
 	}
-	last := len(c.ttlKeys) - 1
-	moved := c.ttlKeys[last]
-	c.ttlKeys[idx] = moved
-	c.ttlIndex[moved] = idx
-	c.ttlKeys = c.ttlKeys[:last]
-	delete(c.ttlIndex, key)
+	last := len(s.ttlKeys) - 1
+	moved := s.ttlKeys[last]
+	s.ttlKeys[idx] = moved
+	s.ttlIndex[moved] = idx
+	s.ttlKeys = s.ttlKeys[:last]
+	delete(s.ttlIndex, key)
 }
 
-func (c *Cache) swapTTLLocked(i, j int) {
-	c.ttlKeys[i], c.ttlKeys[j] = c.ttlKeys[j], c.ttlKeys[i]
-	c.ttlIndex[c.ttlKeys[i]] = i
-	c.ttlIndex[c.ttlKeys[j]] = j
+func (s *shard) swapTTL(i, j int) {
+	s.ttlKeys[i], s.ttlKeys[j] = s.ttlKeys[j], s.ttlKeys[i]
+	s.ttlIndex[s.ttlKeys[i]] = i
+	s.ttlIndex[s.ttlKeys[j]] = j
 }
 
-func (c *Cache) removeExpiredLocked(now time.Time) int {
-	removed := 0
-	for _, item := range c.items {
+func (s *shard) removeExpired(now time.Time, c *Cache) {
+	for _, item := range s.items {
 		if item.expired(now) {
-			c.removeItemLocked(item, "expired")
-			removed++
+			c.removeItem(s, item, "expired")
 		}
 	}
-	return removed
 }
 
-func (c *Cache) evictUntilWithinLimitLocked() {
-	for len(c.items) > c.maxKeys {
-		item := c.evictionVictimLocked()
+// evictionVictim is the global LRU tail or the global LFU tail. Caller holds
+// every shard lock.
+func (c *Cache) evictionVictim() (*shard, *entry) {
+	var bestShard *shard
+	var best *entry
+	for i := range c.shards {
+		s := &c.shards[i]
+		item := s.localVictim(c.evictionPolicy)
 		if item == nil {
-			return
+			continue
 		}
-		c.removeItemLocked(item, "max_keys")
+		if best == nil || victimLess(c.evictionPolicy, item, best) {
+			best = item
+			bestShard = s
+		}
 	}
+	return bestShard, best
 }
 
-func (c *Cache) evictionVictimLocked() *entry {
-	if c.evictionPolicy == EvictionLFU {
-		var victim *entry
-		for _, item := range c.items {
-			if victim == nil ||
-				item.accessCount < victim.accessCount ||
-				(item.accessCount == victim.accessCount && item.lastAccessedAt.Before(victim.lastAccessedAt)) {
-				victim = item
+func (s *shard) localVictim(policy EvictionPolicy) *entry {
+	if policy == EvictionLFU {
+		bucket := s.freqBuckets[s.minFreq]
+		if bucket == nil || bucket.Len() == 0 {
+			s.recomputeMinFreq()
+			bucket = s.freqBuckets[s.minFreq]
+			if bucket == nil || bucket.Len() == 0 {
+				return nil
 			}
 		}
-		return victim
+		return bucket.Back().Value.(*entry)
 	}
-	el := c.lru.Back()
+	el := s.lru.Back()
 	if el == nil {
 		return nil
 	}
 	return el.Value.(*entry)
 }
 
-func (c *Cache) removeItemLocked(item *entry, reason string) {
-	c.untrackTTLLocked(item.key)
-	delete(c.items, item.key)
-	c.lru.Remove(item.lruElement)
-	c.memoryBytes -= item.sizeBytes
-	if c.memoryBytes < 0 {
-		c.memoryBytes = 0
+func victimLess(policy EvictionPolicy, a, b *entry) bool {
+	if policy == EvictionLFU && a.accessCount != b.accessCount {
+		return a.accessCount < b.accessCount
 	}
+	return a.lastAccessedAt.Before(b.lastAccessedAt)
+}
+
+func (c *Cache) removeItem(s *shard, item *entry, reason string) {
+	s.untrackTTL(item.key)
+	if c.evictionPolicy == EvictionLFU {
+		s.unlinkLFU(item)
+	}
+	delete(s.items, item.key)
+	if item.lruElement != nil {
+		s.lru.Remove(item.lruElement)
+		item.lruElement = nil
+	}
+	c.addMemory(-item.sizeBytes)
+	c.keyCount.Add(-1)
 	if reason == "max_keys" {
 		c.recorder.RecordEviction(item.key, reason)
 	}
 }
 
-func (c *Cache) appendLogLocked(record ReplayRecord) {
-	if c.appendLog == nil {
+func (s *shard) linkLFU(item *entry) {
+	bucket := s.freqBuckets[item.accessCount]
+	if bucket == nil {
+		bucket = list.New()
+		s.freqBuckets[item.accessCount] = bucket
+	}
+	item.lfuElement = bucket.PushFront(item)
+	if len(s.freqBuckets) == 1 && bucket.Len() == 1 {
+		s.minFreq = item.accessCount
 		return
 	}
-	data, err := json.Marshal(record)
-	if err != nil {
+	if item.accessCount < s.minFreq {
+		s.minFreq = item.accessCount
+	}
+}
+
+// touchLFU moves a key to the front of its current frequency list without
+// counting another hit. SET uses that so a rewrite loses a same-frequency tie.
+func (s *shard) touchLFU(item *entry) {
+	s.unlinkLFU(item)
+	s.linkLFU(item)
+}
+
+func (s *shard) promoteLFU(item *entry) {
+	s.unlinkLFU(item)
+	item.accessCount++
+	s.linkLFU(item)
+}
+
+func (s *shard) unlinkLFU(item *entry) {
+	if item.lfuElement == nil {
 		return
 	}
-	_, _ = c.appendLog.Write(append(data, '\n'))
+	freq := item.accessCount
+	bucket := s.freqBuckets[freq]
+	if bucket != nil {
+		bucket.Remove(item.lfuElement)
+	}
+	item.lfuElement = nil
+	if bucket == nil || bucket.Len() == 0 {
+		delete(s.freqBuckets, freq)
+		if freq == s.minFreq {
+			s.minFreq++
+			if _, ok := s.freqBuckets[s.minFreq]; !ok {
+				s.recomputeMinFreq()
+			}
+		}
+	}
+}
+
+func (s *shard) recomputeMinFreq() {
+	if len(s.freqBuckets) == 0 {
+		s.minFreq = 0
+		return
+	}
+	first := true
+	var min int64
+	for freq := range s.freqBuckets {
+		if first || freq < min {
+			min = freq
+			first = false
+		}
+	}
+	s.minFreq = min
 }
 
 func (c *Cache) loadSnapshot(path string) error {
@@ -725,11 +961,16 @@ func (c *Cache) loadSnapshot(path string) error {
 		return err
 	}
 	now := time.Now().UTC()
+	c.lockAll()
+	defer c.unlockAll()
 	for _, saved := range file.Entries {
 		if !saved.ExpiresAt.IsZero() && !saved.ExpiresAt.After(now) {
 			continue
 		}
-		size := estimateSize(saved.Key, saved.Value)
+		s := c.shard(saved.Key)
+		if _, exists := s.items[saved.Key]; exists {
+			continue
+		}
 		item := &entry{
 			key:            saved.Key,
 			value:          saved.Value,
@@ -738,14 +979,11 @@ func (c *Cache) loadSnapshot(path string) error {
 			updatedAt:      saved.UpdatedAt,
 			lastAccessedAt: saved.LastAccessedAt,
 			accessCount:    saved.AccessCount,
-			sizeBytes:      size,
+			sizeBytes:      estimateSize(saved.Key, saved.Value),
 		}
-		item.lruElement = c.lru.PushFront(item)
-		c.items[item.key] = item
-		c.memoryBytes += size
-		c.trackTTLLocked(item)
+		c.insertItem(s, item)
 	}
-	c.evictUntilWithinLimitLocked()
+	c.makeRoom()
 	return nil
 }
 

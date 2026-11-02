@@ -2,10 +2,13 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -342,6 +345,113 @@ func TestLFUEvictsLeastFrequentlyUsed(t *testing.T) {
 	if result, _ := c.Get(context.Background(), "a"); !result.Hit {
 		t.Fatal("expected frequently used a to remain")
 	}
+	assertLFUBuckets(t, c)
+}
+
+func TestLFUEvictsInFrequencyThenRecencyOrder(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 3, EvictionPolicy: EvictionLFU})
+	ctx := context.Background()
+
+	mustSet(t, c, "a", "1")
+	mustSet(t, c, "b", "2")
+	mustSet(t, c, "c", "3")
+	for i := 0; i < 3; i++ {
+		if _, err := c.Get(ctx, "a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Get(ctx, "b"); err != nil {
+		t.Fatal(err)
+	}
+	// Frequencies: a=3, b=1, c=0. c is the least used.
+	mustSet(t, c, "d", "4")
+	assertMissing(t, c, "c")
+	assertHit(t, c, "a", "1")
+	assertHit(t, c, "b", "2")
+	assertHit(t, c, "d", "4")
+	assertLFUBuckets(t, c)
+
+	// d is the only frequency-0 key.
+	mustSet(t, c, "e", "5")
+	assertMissing(t, c, "d")
+	assertHit(t, c, "a", "1")
+	assertHit(t, c, "b", "2")
+	assertLFUBuckets(t, c)
+
+	// Same frequency: the older access loses. Stamp the times so the result
+	// does not depend on the clock resolution or which shard each key hits.
+	tied := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU})
+	mustSet(t, tied, "older", "1")
+	mustSet(t, tied, "newer", "2")
+	if _, err := tied.Get(ctx, "older"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tied.Get(ctx, "newer"); err != nil {
+		t.Fatal(err)
+	}
+	stampAccess(t, tied, "older", time.Unix(10, 0).UTC(), false)
+	stampAccess(t, tied, "newer", time.Unix(20, 0).UTC(), true)
+	mustSet(t, tied, "fresh", "3")
+	assertMissing(t, tied, "older")
+	assertHit(t, tied, "newer", "2")
+	assertHit(t, tied, "fresh", "3")
+	assertLFUBuckets(t, tied)
+}
+
+func TestLFUSnapshotRestoresFrequency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinycache.snapshot.json")
+	c := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU, SnapshotPath: path})
+	mustSet(t, c, "hot", "1")
+	mustSet(t, c, "cold", "2")
+	for i := 0; i < 3; i++ {
+		if _, err := c.Get(context.Background(), "hot"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.SaveSnapshot(""); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	loaded := newTestCache(t, Options{MaxKeys: 2, EvictionPolicy: EvictionLFU, SnapshotPath: path})
+	mustSet(t, loaded, "new", "3")
+	assertMissing(t, loaded, "cold")
+	assertHit(t, loaded, "hot", "1")
+	assertLFUBuckets(t, loaded)
+}
+
+func TestConcurrentAccessUnderEviction(t *testing.T) {
+	ctx := context.Background()
+	for _, policy := range []EvictionPolicy{EvictionLRU, EvictionLFU} {
+		t.Run(string(policy), func(t *testing.T) {
+			c := newTestCache(t, Options{MaxKeys: 32, EvictionPolicy: policy, CleanupInterval: time.Hour})
+			var wg sync.WaitGroup
+			for g := 0; g < 8; g++ {
+				wg.Add(1)
+				go func(g int) {
+					defer wg.Done()
+					for i := 0; i < 100; i++ {
+						key := fmt.Sprintf("k-%d", (g*17+i)%48)
+						_ = c.Set(ctx, key, "v", time.Millisecond)
+						_, _ = c.Get(ctx, key)
+						_, _ = c.TTL(ctx, key)
+						_, _ = c.Expire(ctx, key, time.Second)
+						if i%5 == 0 {
+							_, _ = c.Delete(ctx, key)
+						}
+					}
+				}(g)
+			}
+			wg.Wait()
+			if got := c.Metrics().KeyCount; got < 0 || got > 32 {
+				t.Fatalf("key count %d out of range", got)
+			}
+			assertKeyCount(t, c)
+			if policy == EvictionLFU {
+				assertLFUBuckets(t, c)
+			}
+		})
+	}
 }
 
 func TestUpdateExistingKeyDoesNotIncreaseKeyCount(t *testing.T) {
@@ -447,6 +557,232 @@ func TestAppendLogReplayRecords(t *testing.T) {
 	}
 }
 
+func TestAOFWriteErrorSurfaces(t *testing.T) {
+	c := newTestCache(t, Options{
+		MaxKeys:       4,
+		AppendLogPath: filepath.Join(t.TempDir(), "tinycache.aof"),
+		AppendFsync:   FsyncNo,
+	})
+	c.aof.mu.Lock()
+	real := c.aof.file
+	c.aof.file = errSyncWriter{err: errors.New("disk full")}
+	c.aof.mu.Unlock()
+	t.Cleanup(func() {
+		if real != nil {
+			_ = real.Close()
+		}
+	})
+
+	err := c.Set(context.Background(), "name", "tiny", 0)
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected aof write error, got %v", err)
+	}
+}
+
+func TestAOFDeviceWriteErrorSurfaces(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("/dev/full is not available")
+	}
+	c := newTestCache(t, Options{
+		MaxKeys:       4,
+		AppendLogPath: "/dev/full",
+		AppendFsync:   FsyncNo,
+	})
+	err := c.Set(context.Background(), "name", "tiny", 0)
+	if err == nil {
+		t.Fatal("expected /dev/full write to surface an error")
+	}
+}
+
+func TestAOFOpenErrorSurfaces(t *testing.T) {
+	c := newTestCache(t, Options{MaxKeys: 4, AppendLogPath: t.TempDir(), AppendFsync: FsyncNo})
+	err := c.Set(context.Background(), "name", "tiny", 0)
+	if err == nil {
+		t.Fatal("expected append log open error to surface on set")
+	}
+}
+
+func TestAppendFsyncAlwaysSyncsEachWrite(t *testing.T) {
+	c := newTestCache(t, Options{
+		MaxKeys:       4,
+		AppendLogPath: filepath.Join(t.TempDir(), "tinycache.aof"),
+		AppendFsync:   FsyncAlways,
+	})
+	fake := &fakeAOF{}
+	c.aof.mu.Lock()
+	real := c.aof.file
+	c.aof.file = fake
+	c.aof.mu.Unlock()
+	t.Cleanup(func() {
+		if real != nil {
+			_ = real.Close()
+		}
+	})
+
+	for _, key := range []string{"a", "b", "c"} {
+		if err := c.Set(context.Background(), key, "v", 0); err != nil {
+			t.Fatalf("set %s: %v", key, err)
+		}
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.writes != 3 || fake.syncs != 3 {
+		t.Fatalf("writes=%d syncs=%d, want 3 writes and 3 syncs", fake.writes, fake.syncs)
+	}
+}
+
+func TestAppendFsyncNoSkipsSync(t *testing.T) {
+	fake := &fakeAOF{}
+	logger := &appendLogger{file: fake, policy: FsyncNo, interval: time.Second}
+	if err := logger.write(ReplayRecord{Command: "set", Key: "k", Value: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.close(); err != nil {
+		t.Fatal(err)
+	}
+	if fake.writes != 1 || fake.syncs != 0 {
+		t.Fatalf("writes=%d syncs=%d, want 1 write and 0 syncs", fake.writes, fake.syncs)
+	}
+}
+
+func TestAppendFsyncEverySecTicksAndShutsDown(t *testing.T) {
+	fake := &fakeAOF{}
+	logger := &appendLogger{file: fake, policy: FsyncEverySec, interval: 15 * time.Millisecond}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		logger.everySecLoop(stop)
+	}()
+
+	if err := logger.write(ReplayRecord{Command: "set", Key: "k", Value: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	syncedOnWrite := fake.syncs
+	fake.mu.Unlock()
+	if syncedOnWrite != 0 {
+		t.Fatalf("everysec synced inside write, syncs=%d", syncedOnWrite)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		fake.mu.Lock()
+		synced := fake.syncs
+		fake.mu.Unlock()
+		if synced >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	fake.mu.Lock()
+	synced := fake.syncs
+	fake.mu.Unlock()
+	if synced < 1 {
+		t.Fatal("background ticker did not fsync")
+	}
+
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("everysec loop did not return after stop")
+	}
+}
+
+func TestAOFReplayAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinycache.aof")
+	c := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path, AppendFsync: FsyncAlways})
+	mustSet(t, c, "name", "tiny")
+	if updated, err := c.Expire(context.Background(), "name", 30*time.Second); err != nil || !updated {
+		t.Fatalf("expire updated=%v err=%v", updated, err)
+	}
+	if deleted, err := c.Delete(context.Background(), "name"); err != nil || !deleted {
+		t.Fatalf("delete deleted=%v err=%v", deleted, err)
+	}
+	c.Close()
+
+	restarted := newTestCache(t, Options{MaxKeys: 10, AppendLogPath: path, AppendFsync: FsyncEverySec})
+	records, err := restarted.ReplayRecords()
+	if err != nil {
+		t.Fatalf("replay records: %v", err)
+	}
+	if len(records) != 3 || records[0].Command != "set" || records[1].Command != "expire" || records[2].Command != "del" {
+		t.Fatalf("unexpected records: %#v", records)
+	}
+
+	replayed := newTestCache(t, Options{MaxKeys: 10})
+	for _, record := range records {
+		switch record.Command {
+		case "set":
+			if err := replayed.Set(context.Background(), record.Key, record.Value, time.Duration(record.TTLSeconds)*time.Second); err != nil {
+				t.Fatalf("replay set: %v", err)
+			}
+		case "expire":
+			if _, err := replayed.Expire(context.Background(), record.Key, time.Duration(record.TTLSeconds)*time.Second); err != nil {
+				t.Fatalf("replay expire: %v", err)
+			}
+		case "del":
+			if _, err := replayed.Delete(context.Background(), record.Key); err != nil {
+				t.Fatalf("replay del: %v", err)
+			}
+		default:
+			t.Fatalf("unknown command %s", record.Command)
+		}
+	}
+	result, err := replayed.Get(context.Background(), "name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Hit {
+		t.Fatal("replayed delete should leave name missing")
+	}
+}
+
+func TestParseFsyncPolicy(t *testing.T) {
+	policy, err := ParseFsyncPolicy("")
+	if err != nil || policy != FsyncEverySec {
+		t.Fatalf("empty policy = %s err=%v", policy, err)
+	}
+	if _, err := ParseFsyncPolicy("sometimes"); err == nil {
+		t.Fatal("expected invalid policy error")
+	}
+}
+
+type fakeAOF struct {
+	mu     sync.Mutex
+	writes int
+	syncs  int
+	err    error
+}
+
+func (f *fakeAOF) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	f.writes++
+	return len(p), nil
+}
+
+func (f *fakeAOF) Sync() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncs++
+	return nil
+}
+
+func (f *fakeAOF) Close() error { return nil }
+
+type errSyncWriter struct {
+	err error
+}
+
+func (w errSyncWriter) Write([]byte) (int, error) { return 0, w.err }
+func (w errSyncWriter) Sync() error               { return nil }
+func (w errSyncWriter) Close() error              { return nil }
+
 func BenchmarkSet(b *testing.B) {
 	c := New(Options{MaxKeys: b.N + 1})
 	defer c.Close()
@@ -481,6 +817,60 @@ func BenchmarkEvictLRU(b *testing.B) {
 	}
 }
 
+func BenchmarkEvictLFU(b *testing.B) {
+	c := New(Options{MaxKeys: 100, EvictionPolicy: EvictionLFU})
+	defer c.Close()
+	for i := 0; i < b.N; i++ {
+		_ = c.Set(context.Background(), fmt.Sprintf("key-%d", i), "value", 0)
+	}
+}
+
+func BenchmarkGetHitParallel(b *testing.B) {
+	c := New(Options{MaxKeys: 1024, CleanupInterval: time.Hour})
+	defer c.Close()
+	ctx := context.Background()
+	keys := make([]string, 256)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key-%d", i)
+		if err := c.Set(ctx, keys[i], "value", 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+	var seq atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := int(seq.Add(1) * 17)
+		for pb.Next() {
+			_, _ = c.Get(ctx, keys[i&255])
+			i++
+		}
+	})
+}
+
+func BenchmarkMixedParallel(b *testing.B) {
+	c := New(Options{MaxKeys: 1024, CleanupInterval: time.Hour})
+	defer c.Close()
+	ctx := context.Background()
+	keys := make([]string, 256)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key-%d", i)
+		_ = c.Set(ctx, keys[i], "value", 0)
+	}
+	var seq atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := int(seq.Add(1) * 17)
+		for pb.Next() {
+			if i&7 == 0 {
+				_ = c.Set(ctx, keys[i&255], "value", 0)
+			} else {
+				_, _ = c.Get(ctx, keys[i&255])
+			}
+			i++
+		}
+	})
+}
+
 func newTestCache(t *testing.T, opts Options) *Cache {
 	t.Helper()
 	if opts.EventLogSize == 0 {
@@ -500,25 +890,116 @@ func mustSet(t *testing.T, c *Cache, key, value string) {
 
 func assertTTLIndex(t *testing.T, c *Cache) {
 	t.Helper()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.ttlKeys) != len(c.ttlIndex) {
-		t.Fatalf("ttl set len keys=%d index=%d", len(c.ttlKeys), len(c.ttlIndex))
-	}
-	for i, key := range c.ttlKeys {
-		idx, ok := c.ttlIndex[key]
-		if !ok || idx != i {
-			t.Fatalf("ttl index mismatch for %s at %d: idx=%d ok=%v", key, i, idx, ok)
+	c.lockAll()
+	defer c.unlockAll()
+	for id := range c.shards {
+		s := &c.shards[id]
+		if len(s.ttlKeys) != len(s.ttlIndex) {
+			t.Fatalf("shard %d ttl set len keys=%d index=%d", id, len(s.ttlKeys), len(s.ttlIndex))
 		}
-		item, ok := c.items[key]
-		if !ok || item.expiresAt.IsZero() {
-			t.Fatalf("ttl key %s missing a live expiry", key)
+		for i, key := range s.ttlKeys {
+			idx, ok := s.ttlIndex[key]
+			if !ok || idx != i {
+				t.Fatalf("shard %d ttl index mismatch for %s at %d: idx=%d ok=%v", id, key, i, idx, ok)
+			}
+			item, ok := s.items[key]
+			if !ok || item.expiresAt.IsZero() {
+				t.Fatalf("ttl key %s missing a live expiry", key)
+			}
+		}
+		for key, item := range s.items {
+			_, tracked := s.ttlIndex[key]
+			if item.expiresAt.IsZero() == tracked {
+				t.Fatalf("ttl tracking mismatch for %s tracked=%v expires=%s", key, tracked, item.expiresAt)
+			}
 		}
 	}
-	for key, item := range c.items {
-		_, tracked := c.ttlIndex[key]
-		if item.expiresAt.IsZero() == tracked {
-			t.Fatalf("ttl tracking mismatch for %s tracked=%v expires=%s", key, tracked, item.expiresAt)
+}
+
+func stampAccess(t *testing.T, c *Cache, key string, at time.Time, front bool) {
+	t.Helper()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.items[key]
+	if !ok {
+		t.Fatalf("missing %s", key)
+	}
+	item.lastAccessedAt = at
+	if front {
+		s.lru.MoveToFront(item.lruElement)
+	} else {
+		s.lru.MoveToBack(item.lruElement)
+	}
+	if c.evictionPolicy == EvictionLFU && item.lfuElement != nil {
+		bucket := s.freqBuckets[item.accessCount]
+		if front {
+			bucket.MoveToFront(item.lfuElement)
+		} else {
+			bucket.MoveToBack(item.lfuElement)
+		}
+	}
+}
+
+func assertHit(t *testing.T, c *Cache, key, value string) {
+	t.Helper()
+	result, err := c.Get(context.Background(), key)
+	if err != nil || !result.Hit || result.Value != value {
+		t.Fatalf("%s: %#v err=%v", key, result, err)
+	}
+}
+
+func assertMissing(t *testing.T, c *Cache, key string) {
+	t.Helper()
+	result, err := c.Get(context.Background(), key)
+	if err != nil || result.Hit {
+		t.Fatalf("%s still present: %#v err=%v", key, result, err)
+	}
+}
+
+func assertKeyCount(t *testing.T, c *Cache) {
+	t.Helper()
+	c.lockAll()
+	defer c.unlockAll()
+	n := 0
+	for i := range c.shards {
+		n += len(c.shards[i].items)
+	}
+	if got := int(c.keyCount.Load()); got != n {
+		t.Fatalf("keyCount=%d shard lens=%d", got, n)
+	}
+}
+
+func assertLFUBuckets(t *testing.T, c *Cache) {
+	t.Helper()
+	c.lockAll()
+	defer c.unlockAll()
+	for id := range c.shards {
+		s := &c.shards[id]
+		seen := 0
+		var min int64
+		first := true
+		for freq, bucket := range s.freqBuckets {
+			if bucket.Len() == 0 {
+				t.Fatalf("shard %d has an empty frequency bucket %d", id, freq)
+			}
+			if first || freq < min {
+				min = freq
+				first = false
+			}
+			for el := bucket.Front(); el != nil; el = el.Next() {
+				item := el.Value.(*entry)
+				if item.accessCount != freq || item.lfuElement != el {
+					t.Fatalf("shard %d key %s freq bucket mismatch", id, item.key)
+				}
+				seen++
+			}
+		}
+		if seen != len(s.items) {
+			t.Fatalf("shard %d lfu nodes=%d items=%d", id, seen, len(s.items))
+		}
+		if seen > 0 && s.minFreq != min {
+			t.Fatalf("shard %d minFreq=%d want %d", id, s.minFreq, min)
 		}
 	}
 }
