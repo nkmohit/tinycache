@@ -34,12 +34,12 @@ The AOF is JSON lines. One `Write` call stores one record plus a newline. Times 
 
 | `command` | Fields | Effect on replay |
 | --- | --- | --- |
-| `set` | `key`, `value`, `expiresAt`, `at`, optional `ttlSeconds` | Insert or replace the key |
-| `expire` | `key`, `expiresAt`, `at`, optional `ttlSeconds` | Set the expiry when the key exists |
+| `set` | `key`, `value`, `expiresAt`, `at`, optional `ttlSeconds`, optional `ttlNanos` | Insert or replace the key |
+| `expire` | `key`, `expiresAt`, `at`, optional `ttlSeconds`, optional `ttlNanos` | Set the expiry when the key exists |
 | `del` | `key`, `at` | Remove the key |
 | `base` | `at` | Drop every key, including keys loaded from the snapshot |
 
-`expiresAt` is the absolute expiry. It is omitted when the key does not expire. `ttlSeconds` is the whole-second distance from `at` to `expiresAt` and is kept so older readers can see a duration. Replay uses `expiresAt` when it is present. A record that has only `ttlSeconds` expires at `at` plus that many seconds.
+`expiresAt` is the absolute expiry. It is omitted when the key does not expire. `ttlNanos` is the exact duration from `at` to `expiresAt`. `ttlSeconds` is that duration rounded up to a whole second so an older reader does not treat a sub-second TTL as no expiry. Replay uses `expiresAt` when it is present. A record with no `expiresAt` uses `ttlNanos` when that field is positive, and otherwise `at` plus `ttlSeconds`. A duration that does not fit in `time.Duration` is rejected instead of wrapping.
 
 ```json
 {"command":"base","at":"2026-11-02T00:00:00.1Z"}

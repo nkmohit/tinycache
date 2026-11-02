@@ -1,0 +1,9 @@
+# Default linters stay on (errcheck, gosimple, govet, ineffassign, staticcheck,
+# unused). gosec is added on top. A finding is suppressed only next to the
+# line it applies to, with the check name and the reason.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - gosec

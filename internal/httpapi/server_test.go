@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +67,10 @@ func TestInvalidRequests(t *testing.T) {
 		{name: "negative set ttl", method: http.MethodPost, path: "/command/set", body: `{"key":"x","value":"x","ttlSeconds":-1}`},
 		{name: "empty get key", method: http.MethodGet, path: "/command/get", body: ""},
 		{name: "negative expire ttl", method: http.MethodPost, path: "/command/expire", body: `{"key":"x","ttlSeconds":-1}`},
+		{name: "overflowing set ttl", method: http.MethodPost, path: "/command/set", body: `{"key":"x","value":"x","ttlSeconds":9227000000}`},
+		{name: "overflowing expire ttl", method: http.MethodPost, path: "/command/expire", body: `{"key":"x","ttlSeconds":"9223372036854775807ms"}`},
+		{name: "invalid sort", method: http.MethodGet, path: "/debug/keys?sort=nope", body: ""},
+		{name: "snapshot path override", method: http.MethodPost, path: "/admin/snapshot", body: `{"path":"/tmp/not-the-configured-snapshot"}`},
 	}
 
 	for _, tt := range tests {
@@ -75,6 +80,25 @@ func TestInvalidRequests(t *testing.T) {
 				t.Fatalf("expected 400, got status=%d body=%v", status, body)
 			}
 		})
+	}
+}
+
+func TestStringTTLAndRequestLimit(t *testing.T) {
+	s := newTestServer(t)
+
+	status, body := request(t, s, http.MethodPost, "/command/set", `{"key":"name","value":"tiny","ttlSeconds":"500ms"}`)
+	if status != http.StatusOK || body["ok"] != true {
+		t.Fatalf("string ttl status=%d body=%v", status, body)
+	}
+	status, body = request(t, s, http.MethodGet, "/command/get?key=name", "")
+	if status != http.StatusOK || body["hit"] != true {
+		t.Fatalf("expected hit after string ttl, status=%d body=%v", status, body)
+	}
+
+	huge := `{"key":"k","value":"` + strings.Repeat("v", cache.MaxRequestBytes) + `"}`
+	status, body = request(t, s, http.MethodPost, "/command/set", huge)
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got status=%d body=%v", status, body)
 	}
 }
 

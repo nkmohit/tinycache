@@ -90,10 +90,13 @@ func (c *Cache) SaveSnapshot(path string) error {
 }
 
 func (c *Cache) loadSnapshot(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := readCapped(path, MaxLogBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
+		}
+		if errors.Is(err, errInputTooLarge) {
+			return ErrSnapshotTooLarge
 		}
 		return err
 	}
@@ -104,14 +107,19 @@ func (c *Cache) loadSnapshot(path string) error {
 	now := time.Now().UTC()
 	c.lockAll()
 	defer c.unlockAll()
-	c.installSnapshotEntries(entries, now)
-	return nil
+	return c.installSnapshotEntries(entries, now)
 }
 
-func (c *Cache) installSnapshotEntries(entries []snapshotEntry, now time.Time) {
+func (c *Cache) installSnapshotEntries(entries []snapshotEntry, now time.Time) error {
 	for _, saved := range entries {
 		if !saved.ExpiresAt.IsZero() && !saved.ExpiresAt.After(now) {
 			continue
+		}
+		if err := validateKey(saved.Key); err != nil {
+			return err
+		}
+		if err := validateValue(saved.Value); err != nil {
+			return err
 		}
 		s := c.shard(saved.Key)
 		if _, exists := s.items[saved.Key]; exists {
@@ -132,6 +140,7 @@ func (c *Cache) installSnapshotEntries(entries []snapshotEntry, now time.Time) {
 		}
 		c.insertItem(s, item)
 	}
+	return nil
 }
 
 func encodeSnapshot(savedAt time.Time, entries []snapshotEntry) ([]byte, error) {
@@ -252,7 +261,7 @@ func atomicWriteFile(path string, data []byte) error {
 			_ = os.Remove(tmpName)
 		}
 	}()
-	if err := tmp.Chmod(0o644); err != nil {
+	if err := tmp.Chmod(0o600); err != nil {
 		return err
 	}
 	if _, err := tmp.Write(data); err != nil {

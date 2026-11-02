@@ -97,7 +97,7 @@ func openAppendLogger(path string, policy FsyncPolicy, percentage int, minSize i
 		percentage: percentage,
 		minSize:    minSize,
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		log.Printf("tinycache aof: open %s: %v", path, err)
 		logger.err = err
@@ -192,8 +192,10 @@ func commandRecord(command, key, value string, expiresAt, at time.Time) ReplayRe
 		At:        at,
 	}
 	if !expiresAt.IsZero() && !at.IsZero() {
-		if secs := int64(expiresAt.Sub(at).Seconds()); secs > 0 {
+		if d := expiresAt.Sub(at); d > 0 {
+			secs, nanos := replayTTL(d)
 			rec.TTLSeconds = secs
+			rec.TTLNanos = nanos
 		}
 	}
 	return rec

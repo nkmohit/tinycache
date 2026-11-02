@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math"
 	"math/rand"
 	"sort"
 	"strings"
@@ -16,12 +17,19 @@ import (
 )
 
 var (
-	ErrEmptyKey       = errors.New("key cannot be empty")
-	ErrInvalidTTL     = errors.New("ttl cannot be negative")
-	ErrInvalidPolicy  = errors.New("eviction policy must be lru, lfu, allkeys-lru, allkeys-lfu, allkeys-random, volatile-ttl, or noeviction")
-	ErrSnapshotPath   = errors.New("snapshot path is not configured")
-	ErrAppendLogPath  = errors.New("append-only log path is not configured")
-	ErrInvalidKeySort = errors.New("sort must be key, ttl, size, access, updated, or accessed")
+	ErrEmptyKey         = errors.New("key cannot be empty")
+	ErrInvalidTTL       = errors.New("ttl cannot be negative")
+	ErrInvalidPolicy    = errors.New("eviction policy must be lru, lfu, allkeys-lru, allkeys-lfu, allkeys-random, volatile-ttl, or noeviction")
+	ErrSnapshotPath     = errors.New("snapshot path is not configured")
+	ErrAppendLogPath    = errors.New("append-only log path is not configured")
+	ErrInvalidKeySort   = errors.New("sort must be key, ttl, size, access, updated, or accessed")
+	ErrMalformedTTL     = errors.New("invalid ttl")
+	ErrTTLOverflow      = errors.New("ttl overflows the representable range")
+	ErrKeyTooLarge      = errors.New("key exceeds 65536 byte limit")
+	ErrValueTooLarge    = errors.New("value exceeds 262144 byte limit")
+	ErrFilterTooLarge   = errors.New("filter exceeds size limit")
+	ErrAOFTooLarge      = errors.New("append-only log exceeds size limit")
+	ErrSnapshotTooLarge = errors.New("snapshot exceeds size limit")
 	// ErrOOM is returned when a write needs room and the policy cannot free any.
 	// noeviction always returns it at the limit. volatile-ttl returns it when the
 	// shard has no expiring key to remove. A value larger than the shard's byte
@@ -45,6 +53,17 @@ const (
 	// different locks; a GET still updates recency, so it takes that shard's
 	// write lock rather than a read lock.
 	shardCount = 16
+
+	// MaxKeyBytes and MaxValueBytes bound one cache entry. MaxRequestBytes
+	// bounds an HTTP body. MaxAOFLineBytes and MaxLogBytes stop a length in
+	// an untrusted file from forcing an unbounded allocation.
+	MaxKeyBytes     = 64 * 1024
+	MaxValueBytes   = 256 * 1024
+	MaxRequestBytes = 2 << 20
+	MaxAOFLineBytes = 2 << 20
+	MaxLogBytes     = 512 << 20
+
+	maxTTLString = 64
 
 	// defaultMaxMemorySamples matches Redis maxmemory-samples.
 	defaultMaxMemorySamples = 5
@@ -132,7 +151,7 @@ type Cache struct {
 	snapshotPath  string
 	appendLogPath string
 	aof           *appendLogger
-	aofDone       chan struct{}
+	bg            sync.WaitGroup
 
 	// loading is true only while Open is replaying persistence, before any
 	// background goroutine starts. Writes during recovery must not append.
@@ -239,12 +258,18 @@ type Summary struct {
 }
 
 type ReplayRecord struct {
-	Command    string    `json:"command"`
-	Key        string    `json:"key,omitempty"`
-	Value      string    `json:"value,omitempty"`
-	TTLSeconds int64     `json:"ttlSeconds,omitempty"`
-	ExpiresAt  time.Time `json:"expiresAt,omitempty"`
-	At         time.Time `json:"at"`
+	Command    string `json:"command"`
+	Key        string `json:"key,omitempty"`
+	Value      string `json:"value,omitempty"`
+	TTLSeconds int64  `json:"ttlSeconds,omitempty"`
+	// TTLNanos is the exact duration from At to ExpiresAt. Older logs leave
+	// it empty. A reader that understands ExpiresAt uses that absolute time;
+	// a reader that only has TTLNanos or TTLSeconds reconstructs the expiry
+	// from At. Sub-second TTLs used to be stored as ttlSeconds 0, which
+	// replay treated as no expiry.
+	TTLNanos  int64     `json:"ttlNanos,omitempty"`
+	ExpiresAt time.Time `json:"expiresAt,omitempty"`
+	At        time.Time `json:"at"`
 }
 
 // New opens a cache. A snapshot or AOF error panics. Servers should call Open,
@@ -271,8 +296,7 @@ func Open(opts Options) (*Cache, error) {
 	}
 	evictionPolicy, err := ParseEvictionPolicy(string(opts.EvictionPolicy))
 	if err != nil {
-		log.Printf("tinycache eviction: %v", err)
-		evictionPolicy = EvictionLRU
+		return nil, err
 	}
 	samples := opts.MaxMemorySamples
 	if samples <= 0 {
@@ -280,8 +304,7 @@ func Open(opts Options) (*Cache, error) {
 	}
 	fsyncPolicy, err := ParseFsyncPolicy(string(opts.AppendFsync))
 	if err != nil {
-		log.Printf("tinycache aof: %v", err)
-		fsyncPolicy = FsyncEverySec
+		return nil, err
 	}
 
 	c := &Cache{
@@ -307,30 +330,36 @@ func Open(opts Options) (*Cache, error) {
 		c.shards[i].freqBuckets = map[int64]*list.List{}
 		c.shards[i].maxKeys = int(keyCaps[i])
 		c.shards[i].maxMemory = memCaps[i]
-		c.shards[i].rng = rand.New(rand.NewSource(seed + int64(i)*1_000_003))
+		// Victim sampling is not a security boundary.
+		c.shards[i].rng = rand.New(rand.NewSource(seed + int64(i)*1_000_003)) //nolint:gosec // G404: eviction sampling does not need a CSPRNG
 	}
 	if err := c.loadFromDisk(); err != nil {
 		_ = c.aof.close()
 		return nil, err
 	}
 	c.loading.Store(false)
+	// Background work starts only after recovery succeeds. Close waits for
+	// the sweeper, the fsync loop, and any AOF rewrite before it closes the
+	// log. A second Close is a no-op.
 	if c.aof.runsBackgroundSync() {
-		c.aofDone = make(chan struct{})
+		c.bg.Add(1)
 		go func() {
-			defer close(c.aofDone)
+			defer c.bg.Done()
 			c.aof.everySecLoop(c.stopCleanup)
 		}()
 	}
-	go c.cleanupLoop(cleanupInterval)
+	c.bg.Add(1)
+	go func() {
+		defer c.bg.Done()
+		c.cleanupLoop(cleanupInterval)
+	}()
 	return c, nil
 }
 
 func (c *Cache) Close() {
 	c.closeOnce.Do(func() {
 		close(c.stopCleanup)
-		if c.aofDone != nil {
-			<-c.aofDone
-		}
+		c.bg.Wait()
 		if c.aof != nil {
 			c.aof.waitRewrite()
 		}
@@ -350,15 +379,21 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 		})
 	}()
 
-	if key == "" {
-		return ErrEmptyKey
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if err := validateValue(value); err != nil {
+		return err
 	}
 	if ttl < 0 {
 		return ErrInvalidTTL
 	}
 
 	now := time.Now().UTC()
-	expiresAt := expiryFromTTL(now, ttl)
+	expiresAt, err := expiryFromTTL(now, ttl)
+	if err != nil {
+		return err
+	}
 	size := estimateSize(key, value)
 	record := commandRecord("set", key, value, expiresAt, now)
 
@@ -367,10 +402,16 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 	defer s.mu.Unlock()
 
 	if item, ok := s.items[key]; ok {
-		if err := c.updateExisting(s, item, value, expiresAt, size, now); err != nil {
+		// Make room, then append, then publish. A failed append must not
+		// leave the new value visible.
+		if err := c.ensureRoom(s, size-item.sizeBytes, 0, item); err != nil {
 			return err
 		}
-		return c.appendRecord(record)
+		if err := c.appendRecord(record); err != nil {
+			return err
+		}
+		c.updateItem(s, item, value, expiresAt, size, now)
+		return nil
 	}
 
 	item := &entry{
@@ -385,8 +426,11 @@ func (c *Cache) Set(_ context.Context, key, value string, ttl time.Duration) err
 	if err := c.ensureRoom(s, size, 1, nil); err != nil {
 		return err
 	}
+	if err := c.appendRecord(record); err != nil {
+		return err
+	}
 	c.insertItem(s, item)
-	return c.appendRecord(record)
+	return nil
 }
 
 func (c *Cache) Get(_ context.Context, key string) (GetResult, error) {
@@ -401,8 +445,8 @@ func (c *Cache) Get(_ context.Context, key string) (GetResult, error) {
 		})
 	}()
 
-	if key == "" {
-		return result, ErrEmptyKey
+	if err := validateKey(key); err != nil {
+		return result, err
 	}
 
 	now := time.Now().UTC()
@@ -415,7 +459,7 @@ func (c *Cache) Get(_ context.Context, key string) (GetResult, error) {
 		return result, nil
 	}
 	if item.expired(now) {
-		c.removeItem(s, item, "expired")
+		_ = c.removeItem(s, item, "expired")
 		return result, nil
 	}
 
@@ -446,8 +490,8 @@ func (c *Cache) Delete(_ context.Context, key string) (bool, error) {
 		})
 	}()
 
-	if key == "" {
-		return false, ErrEmptyKey
+	if err := validateKey(key); err != nil {
+		return false, err
 	}
 
 	s := c.shard(key)
@@ -458,10 +502,10 @@ func (c *Cache) Delete(_ context.Context, key string) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	c.removeItem(s, item, "")
 	if err := c.appendRecord(commandRecord("del", key, "", time.Time{}, time.Now().UTC())); err != nil {
-		return true, err
+		return false, err
 	}
+	_ = c.removeItem(s, item, "")
 	return true, nil
 }
 
@@ -474,14 +518,18 @@ func (c *Cache) Expire(_ context.Context, key string, ttl time.Duration) (bool, 
 		})
 	}()
 
-	if key == "" {
-		return false, ErrEmptyKey
+	if err := validateKey(key); err != nil {
+		return false, err
 	}
 	if ttl < 0 {
 		return false, ErrInvalidTTL
 	}
 
 	now := time.Now().UTC()
+	expiresAt, err := expiryFromTTL(now, ttl)
+	if err != nil {
+		return false, err
+	}
 	s := c.shard(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -491,17 +539,16 @@ func (c *Cache) Expire(_ context.Context, key string, ttl time.Duration) (bool, 
 		return false, nil
 	}
 	if item.expired(now) {
-		c.removeItem(s, item, "expired")
+		_ = c.removeItem(s, item, "expired")
 		return false, nil
 	}
 
-	expiresAt := expiryFromTTL(now, ttl)
+	if err := c.appendRecord(commandRecord("expire", key, "", expiresAt, now)); err != nil {
+		return false, err
+	}
 	item.expiresAt = expiresAt
 	item.updatedAt = now
 	s.trackTTL(item)
-	if err := c.appendRecord(commandRecord("expire", key, "", expiresAt, now)); err != nil {
-		return true, err
-	}
 	return true, nil
 }
 
@@ -514,8 +561,8 @@ func (c *Cache) TTL(_ context.Context, key string) (int64, error) {
 		})
 	}()
 
-	if key == "" {
-		return TTLMissing, ErrEmptyKey
+	if err := validateKey(key); err != nil {
+		return TTLMissing, err
 	}
 
 	now := time.Now().UTC()
@@ -528,7 +575,7 @@ func (c *Cache) TTL(_ context.Context, key string) (int64, error) {
 		return TTLMissing, nil
 	}
 	if item.expired(now) {
-		c.removeItem(s, item, "expired")
+		_ = c.removeItem(s, item, "expired")
 		return TTLMissing, nil
 	}
 	if item.expiresAt.IsZero() {
@@ -546,21 +593,32 @@ func (c *Cache) TTL(_ context.Context, key string) (int64, error) {
 }
 
 func (c *Cache) SnapshotDebug() DebugSnapshot {
-	return DebugSnapshot{Keys: c.SnapshotKeys(KeyQuery{})}
+	keys, err := c.SnapshotKeys(KeyQuery{})
+	if err != nil {
+		return DebugSnapshot{}
+	}
+	return DebugSnapshot{Keys: keys}
 }
 
-func (c *Cache) SnapshotKeys(query KeyQuery) []KeyDebug {
+func (c *Cache) SnapshotKeys(query KeyQuery) ([]KeyDebug, error) {
+	if err := validateKeySort(query.Sort); err != nil {
+		return nil, err
+	}
+	if len(query.Filter) > MaxKeyBytes {
+		return nil, ErrFilterTooLarge
+	}
 	now := time.Now().UTC()
 	c.lockAll()
 	defer c.unlockAll()
 
+	filter := strings.ToLower(query.Filter)
 	keys := make([]KeyDebug, 0)
 	for i := range c.shards {
 		s := &c.shards[i]
 		s.removeExpired(now, c)
 		for _, item := range s.items {
 			debug := keyDebugFromEntry(item, now)
-			if query.Filter == "" || strings.Contains(strings.ToLower(debug.Key), strings.ToLower(query.Filter)) {
+			if filter == "" || strings.Contains(strings.ToLower(debug.Key), filter) {
 				keys = append(keys, debug)
 			}
 		}
@@ -569,7 +627,7 @@ func (c *Cache) SnapshotKeys(query KeyQuery) []KeyDebug {
 	if query.Limit > 0 && len(keys) > query.Limit {
 		keys = keys[:query.Limit]
 	}
-	return keys
+	return keys, nil
 }
 
 func (c *Cache) LRUKeys() []string {
@@ -612,14 +670,17 @@ func (c *Cache) Events() []metrics.Event {
 	return c.recorder.Events()
 }
 
-func (c *Cache) Summary(query KeyQuery) Summary {
-	keys := c.SnapshotKeys(query)
+func (c *Cache) Summary(query KeyQuery) (Summary, error) {
+	keys, err := c.SnapshotKeys(query)
+	if err != nil {
+		return Summary{}, err
+	}
 	return Summary{
 		Metrics: c.Metrics(),
 		Keys:    keys,
 		LRU:     c.LRUKeys(),
 		Events:  c.Events(),
-	}
+	}, nil
 }
 
 func (c *Cache) cleanupLoop(interval time.Duration) {
@@ -740,7 +801,9 @@ func (c *Cache) ensureRoom(s *shard, extra int64, adding int, keep *entry) error
 		if s.exceedsKeys(adding) {
 			reason = "max_keys"
 		}
-		c.removeItem(s, victim, reason)
+		if err := c.removeItem(s, victim, reason); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -754,15 +817,6 @@ func (s *shard) exceedsMemory(extra int64) bool {
 		return false
 	}
 	return s.bytes+extra > s.maxMemory
-}
-
-func (c *Cache) updateExisting(s *shard, item *entry, value string, expiresAt time.Time, size int64, now time.Time) error {
-	delta := size - item.sizeBytes
-	if err := c.ensureRoom(s, delta, 0, item); err != nil {
-		return err
-	}
-	c.updateItem(s, item, value, expiresAt, size, now)
-	return nil
 }
 
 func (c *Cache) updateItem(s *shard, item *entry, value string, expiresAt time.Time, size int64, now time.Time) {
@@ -813,20 +867,32 @@ func (c *Cache) addMemory(s *shard, delta int64) {
 	if delta == 0 {
 		return
 	}
-	s.bytes += delta
-	if s.bytes < 0 {
-		s.bytes = 0
-	}
+	// A wrapped int64 used to look negative and get clamped to zero, which
+	// wiped the process-wide counter.
+	s.bytes = saturatingAddNonNegative(s.bytes, delta)
 	for {
 		cur := c.memoryBytes.Load()
-		next := cur + delta
-		if next < 0 {
-			next = 0
-		}
+		next := saturatingAddNonNegative(cur, delta)
 		if c.memoryBytes.CompareAndSwap(cur, next) {
 			return
 		}
 	}
+}
+
+func saturatingAddNonNegative(cur, delta int64) int64 {
+	if cur < 0 {
+		cur = 0
+	}
+	if delta >= 0 {
+		if cur > math.MaxInt64-delta {
+			return math.MaxInt64
+		}
+		return cur + delta
+	}
+	if delta == math.MinInt64 || cur < -delta {
+		return 0
+	}
+	return cur + delta
 }
 
 func (s *shard) expireSample(now time.Time, c *Cache) (removed, sampled int) {
@@ -841,7 +907,8 @@ func (s *shard) expireSample(now time.Time, c *Cache) (removed, sampled int) {
 
 	var victims [expireSampleSize]*entry
 	for i := 0; i < sampled; i++ {
-		j := i + rand.Intn(n-i)
+		// Expiry sampling is not a security boundary.
+		j := i + rand.Intn(n-i) //nolint:gosec // G404: TTL sampling does not need a CSPRNG
 		if i != j {
 			s.swapTTL(i, j)
 		}
@@ -852,7 +919,7 @@ func (s *shard) expireSample(now time.Time, c *Cache) (removed, sampled int) {
 		}
 	}
 	for i := 0; i < removed; i++ {
-		c.removeItem(s, victims[i], "expired")
+		_ = c.removeItem(s, victims[i], "expired")
 	}
 	return removed, sampled
 }
@@ -873,7 +940,8 @@ func (s *shard) trackTTL(item *entry) {
 
 func (s *shard) untrackTTL(key string) {
 	idx, ok := s.ttlIndex[key]
-	if !ok {
+	if !ok || idx < 0 || idx >= len(s.ttlKeys) {
+		delete(s.ttlIndex, key)
 		return
 	}
 	last := len(s.ttlKeys) - 1
@@ -893,7 +961,7 @@ func (s *shard) swapTTL(i, j int) {
 func (s *shard) removeExpired(now time.Time, c *Cache) {
 	for _, item := range s.items {
 		if item.expired(now) {
-			c.removeItem(s, item, "expired")
+			_ = c.removeItem(s, item, "expired")
 		}
 	}
 }
@@ -1090,7 +1158,8 @@ func (st *lfuState) decayed(now time.Time) uint8 {
 	if elapsed >= int64(st.log) {
 		st.log = 0
 	} else {
-		st.log -= uint8(elapsed)
+		// elapsed is smaller than st.log, and st.log already fits in uint8.
+		st.log -= uint8(elapsed) //nolint:gosec // G115: elapsed < st.log <= 255
 	}
 	st.decay = nowMin
 	return st.log
@@ -1104,7 +1173,7 @@ func lfuLogIncr(counter uint8, rng *rand.Rand) uint8 {
 	if base < 0 {
 		base = 0
 	}
-	if rng.Intn(base*lfuLogFactor+1) == 0 {
+	if rng.Intn(base*lfuLogFactor+1) == 0 { //nolint:gosec // G404: LFU probability does not need a CSPRNG
 		return counter + 1
 	}
 	return counter
@@ -1134,7 +1203,20 @@ func (s *shard) untrackKey(item *entry) {
 	delete(s.keyIndex, item)
 }
 
-func (c *Cache) removeItem(s *shard, item *entry, reason string) {
+func (c *Cache) removeItem(s *shard, item *entry, reason string) error {
+	current, ok := s.items[item.key]
+	if !ok || current != item {
+		return nil
+	}
+	if (reason == "max_keys" || reason == "maxmemory") && c.aof != nil && !c.loading.Load() {
+		// Log the eviction before the key disappears. A failed append leaves
+		// the victim in place so memory and the log still agree. The rewrite
+		// buffer copies the same record, so a compacted image does not bring
+		// the key back.
+		if err := c.appendRecord(commandRecord("del", item.key, "", time.Time{}, time.Now().UTC())); err != nil {
+			return err
+		}
+	}
 	s.untrackKey(item)
 	delete(s.lfuMeta, item)
 	s.untrackTTL(item.key)
@@ -1150,12 +1232,8 @@ func (c *Cache) removeItem(s *shard, item *entry, reason string) {
 	c.keyCount.Add(-1)
 	if reason == "max_keys" || reason == "maxmemory" {
 		c.recorder.RecordEviction(item.key, reason)
-		// The compacted rewrite is a point-in-time image. A later eviction has
-		// to be in the rewrite buffer or the deleted key comes back on replay.
-		if c.aof != nil && !c.loading.Load() {
-			_ = c.appendRecord(commandRecord("del", item.key, "", time.Time{}, time.Now().UTC()))
-		}
 	}
+	return nil
 }
 
 func (s *shard) linkLFU(item *entry) {
@@ -1228,15 +1306,50 @@ func (e *entry) expired(now time.Time) bool {
 	return !e.expiresAt.IsZero() && !e.expiresAt.After(now)
 }
 
-func expiryFromTTL(now time.Time, ttl time.Duration) time.Time {
+func expiryFromTTL(now time.Time, ttl time.Duration) (time.Time, error) {
 	if ttl == 0 {
-		return time.Time{}
+		return time.Time{}, nil
 	}
-	return now.Add(ttl)
+	if ttl < 0 {
+		return time.Time{}, ErrInvalidTTL
+	}
+	expires := now.Add(ttl)
+	if !expires.After(now) || expires.Sub(now) != ttl {
+		return time.Time{}, ErrTTLOverflow
+	}
+	return expires, nil
 }
 
 func estimateSize(key, value string) int64 {
-	return int64(len(key)+len(value)) + perEntryOverhead
+	// Convert each length before adding. On 32-bit platforms the sum of two
+	// ints can wrap before the conversion to int64.
+	return int64(len(key)) + int64(len(value)) + perEntryOverhead
+}
+
+func validateKey(key string) error {
+	if key == "" {
+		return ErrEmptyKey
+	}
+	if len(key) > MaxKeyBytes {
+		return ErrKeyTooLarge
+	}
+	return nil
+}
+
+func validateValue(value string) error {
+	if len(value) > MaxValueBytes {
+		return ErrValueTooLarge
+	}
+	return nil
+}
+
+func validateKeySort(sortBy string) error {
+	switch sortBy {
+	case "", "key", "ttl", "size", "access", "updated", "accessed":
+		return nil
+	default:
+		return ErrInvalidKeySort
+	}
 }
 
 func keyDebugFromEntry(item *entry, now time.Time) KeyDebug {
@@ -1267,24 +1380,43 @@ func sortKeys(keys []KeyDebug, query KeyQuery) {
 		sortBy = "key"
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		var less bool
-		switch sortBy {
-		case "ttl":
-			less = keys[i].TTL < keys[j].TTL
-		case "size":
-			less = keys[i].SizeBytes < keys[j].SizeBytes
-		case "access":
-			less = keys[i].AccessCount < keys[j].AccessCount
-		case "updated":
-			less = keys[i].UpdatedAt.Before(keys[j].UpdatedAt)
-		case "accessed":
-			less = keys[i].LastAccessedAt.Before(keys[j].LastAccessedAt)
-		default:
-			less = keys[i].Key < keys[j].Key
+		cmp := compareKeyDebug(keys[i], keys[j], sortBy)
+		if cmp == 0 {
+			cmp = strings.Compare(keys[i].Key, keys[j].Key)
 		}
+		// Negating a boolean less-than made Less(i, i) true whenever the
+		// compared fields were equal, which is not a strict weak ordering.
 		if query.Desc {
-			return !less
+			return cmp > 0
 		}
-		return less
+		return cmp < 0
 	})
+}
+
+func compareKeyDebug(a, b KeyDebug, sortBy string) int {
+	switch sortBy {
+	case "ttl":
+		return compareInt64(a.TTL, b.TTL)
+	case "size":
+		return compareInt64(a.SizeBytes, b.SizeBytes)
+	case "access":
+		return compareInt64(a.AccessCount, b.AccessCount)
+	case "updated":
+		return a.UpdatedAt.Compare(b.UpdatedAt)
+	case "accessed":
+		return a.LastAccessedAt.Compare(b.LastAccessedAt)
+	default:
+		return strings.Compare(a.Key, b.Key)
+	}
+}
+
+func compareInt64(a, b int64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"time"
 
 	"github.com/nkmohit/tinycache/internal/cache"
@@ -32,6 +33,9 @@ func main() {
 
 	if *operations <= 0 {
 		log.Fatal("ops must be positive")
+	}
+	if *maxKeys <= 0 || *maxKeys > math.MaxInt/4 {
+		log.Fatal("max-keys must be positive and small enough that max-keys*4 does not overflow")
 	}
 	if *writeRatio < 0 || *writeRatio > 1 {
 		log.Fatal("write-ratio must be between 0 and 1")
@@ -67,13 +71,17 @@ func main() {
 	}
 	elapsed := time.Since(start)
 	metrics := c.Metrics()
+	opsPerSecond := 0.0
+	if secs := elapsed.Seconds(); secs > 0 {
+		opsPerSecond = float64(*operations) / secs
+	}
 	out := result{
 		Operations:     *operations,
 		MaxKeys:        *maxKeys,
 		EvictionPolicy: string(policy),
 		WriteRatio:     *writeRatio,
 		DurationMS:     elapsed.Milliseconds(),
-		OpsPerSecond:   float64(*operations) / elapsed.Seconds(),
+		OpsPerSecond:   opsPerSecond,
 		KeyCount:       metrics.KeyCount,
 		HitRatio:       metrics.HitRatio,
 		Evictions:      metrics.Evictions,
